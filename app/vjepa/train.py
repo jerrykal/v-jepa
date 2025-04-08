@@ -434,7 +434,7 @@ def main(args, resume_preempt=False):
                     mask-pred.
                     """
                     z = encoder(c, masks_enc)
-                    z = predictor(z, h, masks_enc, masks_pred)
+                    z, _ = predictor(z, h, masks_enc, masks_pred)
                     return z
 
                 def loss_fn(z, h):
@@ -450,7 +450,7 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 loss_jepa, loss_reg = 0., 0.
-                with torch.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                with torch.amp.autocast('cuda:0',dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z = forward_context(clips, h)
                     loss_jepa = loss_fn(z, h)  # jepa prediction loss

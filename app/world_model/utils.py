@@ -7,24 +7,124 @@
 
 import logging
 import sys
-import warnings
+import os
 import yaml
-
-
 import torch
+import pprint
+import random
+import numpy as np
 
-import src.models.vision_transformer as video_vit
-import src.models.predictor as vit_pred
-from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
-from src.utils.schedulers import (
-    WarmupCosineSchedule,
-    CosineWDSchedule)
-from src.utils.tensors import trunc_normal_
+from tensorboardX import SummaryWriter
+from app.world_model.replay_buffer import ReplayBuffer
+from src.models.world_models.base_world_model import WorldModelBase
+from src.models.agents.agents import ActorCriticAgent
 
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+
+CONFIG_VERSION = "0.00.0.beta"
+
+
+def build_world_model(params, action_dims, device)->WorldModelBase:
+    from src.models.world_models.jepa_world_model import JEPAWorldModel
+    cfgs_model = params.get("Models")
+    cfgs_env = params.get("Environment")
+    cfgs_mask = params["mask"]
+
+    wm = JEPAWorldModel(
+        action_dims=action_dims,
+        encoder_name="vit_small",
+        image_size=(224,224),
+        patch_size=16,
+        num_frames=16,
+        tubelet_size=4,
+        uniform_power=False,
+
+        use_mask_tokens=True,
+        pred_embed_dim=384,
+        pred_depth=12,
+        zero_init_mask_tokens=True,
+        loss_exp=1.0,
+        reg_coeff=0.0,
+        ema=(0.998, 1.0),
+
+        cfgs_mask=cfgs_mask,
+
+        use_amp=True,
+        dtype=torch.bfloat16,
+    )
+    return wm.to(device=device)
+def build_agent(params, action_dim, device)->ActorCriticAgent:
+    pass
+
+def build_replay_buffer(params, action_dims, device="cpu"):
+    task_parameter = params.get("Environment").get("task_parameter")
+    joint_train_agent = params.get("JointTrainAgent")
+
+    return ReplayBuffer(
+        obs_shape=(task_parameter.get("image_size")[0], task_parameter.get("image_size")[1], 3),
+        action_dim=action_dims,
+        num_envs=joint_train_agent.get("NumEnvs"),
+        max_length=joint_train_agent.get("BufferMaxLength"),
+        warmup_length=joint_train_agent.get("BufferWarmUp"),
+        device=device,
+    )
+
+def load_config(config_path):
+    params = None
+    with open(config_path, 'r') as y_file:
+        params = yaml.load(y_file, Loader=yaml.FullLoader)
+        print(f"Sysytem config version : {CONFIG_VERSION}")
+        print('loaded params...')
+        assert "config_version" in params, "config missing config_version"
+        assert params["config_version"] == CONFIG_VERSION, "config_version not match"
+        print('loaded params success !!')
+
+        pp = pprint.PrettyPrinter(indent=4)
+        pp.pprint(params)
+    return params
+
+def seed_np_torch(seed=20010105):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # some cudnn methods can be random even after fixing the seed unless you tell it to be deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+logging.basicConfig(stream=sys.stdout, level=logging.WARNING)
 logger = logging.getLogger()
 
+class Logger():
+    def __init__(self) -> None:
+        self._init_flag = False
 
+    def init(self, path):
+        self.writer = SummaryWriter(logdir=path, flush_secs=1)
+        self.tag_step = {}
+        self._init_flag = True
+    def log(self, tag, value):
+        if self._init_flag:
+            if tag not in self.tag_step:
+                self.tag_step[tag] = 0
+            else:
+                self.tag_step[tag] += 1
+            if "video" in tag:
+                self.writer.add_video(tag, value, self.tag_step[tag], fps=15)
+            elif "images" in tag:
+                self.writer.add_images(tag, value, self.tag_step[tag])
+            elif "hist" in tag:
+                self.writer.add_histogram(tag, value, self.tag_step[tag])
+            else:
+                self.writer.add_scalar(tag, value, self.tag_step[tag])
+        else:
+            raise Exception("Tensorboard Logger is not initiation.")
+    def close(self):
+        self.writer.close()
+
+## V-JEPA ToDo change to world model
 def load_checkpoint(
     r_path,
     encoder,
@@ -81,130 +181,3 @@ def load_checkpoint(
         scaler,
         epoch,
     )
-
-
-def init_video_model(
-    device,
-    patch_size=16,
-    num_frames=16,
-    tubelet_size=2,
-    model_name='vit_base',
-    crop_size=224,
-    pred_depth=6,
-    pred_embed_dim=384,
-    uniform_power=False,
-    use_mask_tokens=False,
-    num_mask_tokens=2,
-    zero_init_mask_tokens=True,
-    use_sdpa=False,
-):
-    encoder = video_vit.__dict__[model_name](
-        img_size=crop_size,
-        patch_size=patch_size,
-        num_frames=num_frames,
-        tubelet_size=tubelet_size,
-        uniform_power=uniform_power,
-        use_sdpa=use_sdpa,
-    )
-    encoder = MultiMaskWrapper(encoder)
-    predictor = vit_pred.__dict__['vit_predictor'](
-        img_size=crop_size,
-        use_mask_tokens=use_mask_tokens,
-        patch_size=patch_size,
-        num_frames=num_frames,
-        tubelet_size=tubelet_size,
-        embed_dim=encoder.backbone.embed_dim,
-        predictor_embed_dim=pred_embed_dim,
-        depth=pred_depth,
-        num_heads=encoder.backbone.num_heads,
-        uniform_power=uniform_power,
-        num_mask_tokens=num_mask_tokens,
-        zero_init_mask_tokens=zero_init_mask_tokens,
-        use_sdpa=use_sdpa,
-    )
-    predictor = PredictorMultiMaskWrapper(predictor)
-
-    def init_weights(m):
-        if isinstance(m, torch.nn.Linear):
-            trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                torch.nn.init.constant_(m.bias, 0)
-        elif isinstance(m, torch.nn.LayerNorm):
-            torch.nn.init.constant_(m.bias, 0)
-            torch.nn.init.constant_(m.weight, 1.0)
-
-    for m in encoder.modules():
-        init_weights(m)
-
-    for m in predictor.modules():
-        init_weights(m)
-
-    encoder.to(device)
-    predictor.to(device)
-    logger.info(encoder)
-    logger.info(predictor)
-
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    logger.info(f'Encoder number of parameters: {count_parameters(encoder)}')
-    logger.info(f'Predictor number of parameters: {count_parameters(predictor)}')
-
-    return encoder, predictor
-
-
-def init_opt(
-    encoder,
-    predictor,
-    iterations_per_epoch,
-    start_lr,
-    ref_lr,
-    warmup,
-    num_epochs,
-    wd=1e-6,
-    final_wd=1e-6,
-    final_lr=0.0,
-    mixed_precision=False,
-    ipe_scale=1.25,
-    betas=(0.9, 0.999),
-    eps=1e-8,
-    zero_init_bias_wd=True,
-):
-    param_groups = [
-        {
-            'params': (p for n, p in encoder.named_parameters()
-                       if ('bias' not in n) and (len(p.shape) != 1))
-        }, {
-            'params': (p for n, p in predictor.named_parameters()
-                       if ('bias' not in n) and (len(p.shape) != 1))
-        }, {
-            'params': (p for n, p in encoder.named_parameters()
-                       if ('bias' in n) or (len(p.shape) == 1)),
-            'WD_exclude': zero_init_bias_wd,
-            'weight_decay': 0,
-        }, {
-            'params': (p for n, p in predictor.named_parameters()
-                       if ('bias' in n) or (len(p.shape) == 1)),
-            'WD_exclude': zero_init_bias_wd,
-            'weight_decay': 0,
-        },
-    ]
-
-    logger.info('Using AdamW')
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
-    scheduler = WarmupCosineSchedule(
-        optimizer,
-        warmup_steps=int(warmup * iterations_per_epoch),
-        start_lr=start_lr,
-        ref_lr=ref_lr,
-        final_lr=final_lr,
-        T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
-    )
-    wd_scheduler = CosineWDSchedule(
-        optimizer,
-        ref_wd=wd,
-        final_wd=final_wd,
-        T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
-    )
-    scaler = torch.amp.GradScaler() if mixed_precision else None
-    return optimizer, scaler, scheduler, wd_scheduler

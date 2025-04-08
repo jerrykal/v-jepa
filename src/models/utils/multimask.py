@@ -43,6 +43,10 @@ class PredictorMultiMaskWrapper(nn.Module):
             masks_tgt = [masks_tgt]
 
         outs = []
+        fully_outs = []
         for i, (zi, hi, mc, mt) in enumerate(zip(ctxt, tgt, masks_ctxt, masks_tgt)):
-            outs += [self.backbone(zi, hi, mc, mt, mask_index=i)]
-        return outs
+            prediect_z, fully_z = self.backbone(zi, hi, mc, mt, mask_index=i)
+            outs += [prediect_z]
+            fully_outs += [fully_z]
+
+        return outs, fully_outs

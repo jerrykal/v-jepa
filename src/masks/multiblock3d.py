@@ -77,6 +77,7 @@ class _MaskGenerator(object):
         npred=1,
         max_context_frames_ratio=1.0,
         max_keep=None,
+        use_collect=True,
     ):
         super(_MaskGenerator, self).__init__()
         if not isinstance(crop_size, tuple):
@@ -95,7 +96,8 @@ class _MaskGenerator(object):
         self.max_context_duration = max(1, int(self.duration * max_context_frames_ratio))  # maximum number of time-steps (frames) spanned by context mask
         self.max_keep = max_keep  # maximum number of patches to keep in context
         self._itr_counter = Value('i', -1)  # collator is shared across worker processes
-
+        self.use_collect = use_collect
+        
     def step(self):
         i = self._itr_counter
         with i.get_lock():
@@ -194,10 +196,85 @@ class _MaskGenerator(object):
         if self.max_keep is not None:
             min_keep_enc = min(min_keep_enc, self.max_keep)
 
+
         collated_masks_pred = [cm[:min_keep_pred] for cm in collated_masks_pred]
         collated_masks_pred = torch.utils.data.default_collate(collated_masks_pred)
         # --
         collated_masks_enc = [cm[:min_keep_enc] for cm in collated_masks_enc]
         collated_masks_enc = torch.utils.data.default_collate(collated_masks_enc)
+        
+        return collated_masks_enc, collated_masks_pred
 
+
+class _WorldModelMaskGenerator(_MaskGenerator):
+    def __init__(
+            self, 
+            crop_size=(224, 224), 
+            num_frames=16, 
+            spatial_patch_size=(16, 16), 
+            temporal_patch_size=2, 
+            spatial_pred_mask_scale=(0.2, 0.8), 
+            temporal_pred_mask_scale=(1, 1), 
+            aspect_ratio=(0.3, 3), 
+            npred=1, 
+            max_context_frames_ratio=1, 
+            max_keep=None, 
+            use_collect=True):
+        super().__init__(
+            crop_size, num_frames, 
+            spatial_patch_size, temporal_patch_size, 
+            spatial_pred_mask_scale, temporal_pred_mask_scale, aspect_ratio, 
+            npred, max_context_frames_ratio, max_keep, use_collect)
+    def __call__(self, batch_size):
+        """
+        Create encoder and predictor masks when collating imgs into a batch
+        # 1. sample pred block size using seed
+        # 2. sample several pred block locations for each image (w/o seed)
+        # 3. return pred masks and complement (enc mask)
+        """
+        seed = self.step()
+        g = torch.Generator()
+        g.manual_seed(seed)
+        p_size = self._sample_block_size(
+            generator=g,
+            temporal_scale=self.temporal_pred_mask_scale,
+            spatial_scale=self.spatial_pred_mask_scale,
+            aspect_ratio_scale=self.aspect_ratio,
+        )
+
+        collated_masks_pred, collated_masks_enc = [], []
+        min_keep_enc = min_keep_pred = self.duration * self.height * self.width
+        
+        empty_context = True
+        while empty_context:
+
+            mask_e = torch.ones((self.duration, self.height, self.width), dtype=torch.int32)
+            for _ in range(self.npred):
+                mask_e *= self._sample_block_mask(p_size)
+            mask_e = mask_e.flatten()
+
+            mask_p = torch.argwhere(mask_e == 0).squeeze()
+            mask_e = torch.nonzero(mask_e).squeeze()
+
+            empty_context = len(mask_e) == 0
+            if not empty_context:
+                min_keep_pred = min(min_keep_pred, len(mask_p))
+                min_keep_enc = min(min_keep_enc, len(mask_e))
+                collated_masks_pred.append(mask_p)
+                collated_masks_enc.append(mask_e)
+
+        for _ in range(1,batch_size):
+            collated_masks_pred.append(mask_p)
+            collated_masks_enc.append(mask_e)
+
+        if self.max_keep is not None:
+            min_keep_enc = min(min_keep_enc, self.max_keep)
+
+
+        collated_masks_pred = [cm[:min_keep_pred] for cm in collated_masks_pred]
+        collated_masks_pred = torch.utils.data.default_collate(collated_masks_pred)
+        # --
+        collated_masks_enc = [cm[:min_keep_enc] for cm in collated_masks_enc]
+        collated_masks_enc = torch.utils.data.default_collate(collated_masks_enc)
+        
         return collated_masks_enc, collated_masks_pred

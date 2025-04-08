@@ -232,11 +232,14 @@ class VisionTransformerPredictor(nn.Module):
             x = blk(x, mask=masks)
         x = self.predictor_norm(x)
 
-        # Return output corresponding to target tokens
-        x = x[:, N_ctxt:]
-        x = self.predictor_proj(x)
+        # Fully feature
+        fully_x = self.predictor_proj(x)
 
-        return x
+        # Return output corresponding to target tokens
+        predict_x = x[:, N_ctxt:]
+        predict_x = self.predictor_proj(predict_x)
+
+        return predict_x, fully_x
 
 
 def vit_predictor(**kwargs):

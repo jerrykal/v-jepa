@@ -47,8 +47,9 @@ def process_main(rank, fname, world_size, devices):
 
     # Log config
     if rank == 0:
+        os.makedirs(params['logging']['folder'], exist_ok=True)
         pprint.PrettyPrinter(indent=4).pprint(params)
-        dump = os.path.join(params['logging']['folder'], 'params-pretrain.yaml')
+        dump = os.path.join(params['logging']['folder'], 'params.yaml')
         with open(dump, 'w') as f:
             yaml.dump(params, f)
 
