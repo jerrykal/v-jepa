@@ -30,7 +30,7 @@ class PatchEmbed(nn.Module):
 
 class PatchEmbed3D(nn.Module):
     """
-    Image to Patch Embedding
+    Video to Patch Embedding
     """
 
     def __init__(
@@ -51,7 +51,7 @@ class PatchEmbed3D(nn.Module):
             stride=(tubelet_size, patch_size, patch_size),
         )
 
-    def forward(self, x, **kwargs):
+    def forward(self, x, flatten=2, **kwargs):
         B, C, T, H, W = x.shape
-        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.proj(x).flatten(flatten).transpose(1, 2)
         return x

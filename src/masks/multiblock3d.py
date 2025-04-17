@@ -80,9 +80,12 @@ class _MaskGenerator(object):
         use_collect=True,
     ):
         super(_MaskGenerator, self).__init__()
-        if not isinstance(crop_size, tuple):
+        if isinstance(crop_size, list):
+            crop_size = tuple(crop_size)
+        elif not isinstance(crop_size, tuple):
             crop_size = (crop_size, ) * 2
         self.crop_size = crop_size
+  
         self.height, self.width = crop_size[0] // spatial_patch_size, crop_size[1] // spatial_patch_size
         self.duration = num_frames // temporal_patch_size
 
@@ -205,8 +208,44 @@ class _MaskGenerator(object):
         
         return collated_masks_enc, collated_masks_pred
 
+class PrediectFrameMaskGenerator(_MaskGenerator):
+    def __init__(
+            self, 
+            crop_size=(224, 224), 
+            num_frames=16, 
+            spatial_patch_size=(16, 16), 
+            temporal_patch_size=2, 
+            spatial_pred_mask_scale=(0.2, 0.8), 
+            temporal_pred_mask_scale=(1, 1), 
+            aspect_ratio=(0.3, 3), 
+            npred=1, 
+            max_context_frames_ratio=1, 
+            max_keep=None, 
+            use_collect=True):
+        super().__init__(
+            crop_size, num_frames, 
+            spatial_patch_size, temporal_patch_size, 
+            spatial_pred_mask_scale, temporal_pred_mask_scale, aspect_ratio, 
+            npred, max_context_frames_ratio, max_keep, use_collect)
+        
+    def __call__(self, batch_size, num_frames):
+        
+        num_patches_per_frame = self.height * self.width
+        num_total_frames = num_frames + 1  
 
-class _WorldModelMaskGenerator(_MaskGenerator):
+        enc_indices = torch.arange(0, num_frames * num_patches_per_frame, dtype=torch.int64)
+        
+        pred_indices = torch.arange(num_frames * num_patches_per_frame,
+                                    num_total_frames * num_patches_per_frame,
+                                    dtype=torch.int64)
+        collated_masks_enc = [enc_indices.clone() for _ in range(batch_size)]
+        collated_masks_pred = [pred_indices.clone() for _ in range(batch_size)]
+
+        collated_masks_enc = torch.utils.data.default_collate(collated_masks_enc)
+        collated_masks_pred = torch.utils.data.default_collate(collated_masks_pred)
+        return collated_masks_enc, collated_masks_pred
+
+class WorldModelMaskGenerator(_MaskGenerator):
     def __init__(
             self, 
             crop_size=(224, 224), 

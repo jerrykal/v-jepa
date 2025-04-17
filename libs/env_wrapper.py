@@ -11,7 +11,8 @@ def build_single_env(params, frame_skip=4, maxpooling=True, seed = None)->gymnas
     env = MineDojoGymnasium(
         minedojo_env=env,
         skip=frame_skip,
-        seed=seed
+        seed=seed,
+        maxpooling=maxpooling
     )
     return env
 

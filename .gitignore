@@ -1,4 +1,8 @@
 .*.swp
 *.pyc
 logs/*
+runs/*
+ckpt/*
 experiments/*
+*.log
+*.pkl

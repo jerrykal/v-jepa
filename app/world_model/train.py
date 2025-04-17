@@ -1,5 +1,8 @@
 import torch
 import numpy as np
+import os
+import shutil
+import yaml
 
 from einops import rearrange
 from libs import env_wrapper
@@ -8,13 +11,67 @@ from collections import deque
 from app.world_model import utils
 from src.models.agents.agents import ActorCriticAgent
 from app.world_model.replay_buffer import ReplayBuffer
-from src.models.world_models.base_world_model import WorldModelBase
+from src.models.world_models.jepa_world_model import JEPAWorldModel
 
 #Tensorboard Logger
-logger = utils.Logger()
+tensorboard_logger = utils.Logger()
+
+def imagine_data(world_model:JEPAWorldModel,agent: ActorCriticAgent, 
+                sample_obs, sample_action,
+                imagine_batch_size, imagine_batch_length, clip_len,
+                logger, 
+                log_video):
+    world_model.eval()
+    agent.eval()
+    # initial buffer
+    B, _, T, _, _ = sample_obs.shape
+    T = T//world_model.tubelet_size
+    latent_size = (imagine_batch_size, T + imagine_batch_length, world_model.get_num_patches(), world_model.embed_dim)
+    action_size = (imagine_batch_size, T + imagine_batch_length, len(world_model.action_dims))
+    scalar_size = (imagine_batch_size, T + imagine_batch_length)
+
+    embedding_buffer = torch.zeros(latent_size, dtype=world_model.dtype, device="cuda")
+    action_buffer = torch.zeros(action_size, dtype=world_model.dtype, device="cuda")
+    reward_hat_buffer = torch.zeros(scalar_size, dtype=world_model.dtype, device="cuda")
+    termination_hat_buffer = torch.zeros(scalar_size, dtype=world_model.dtype, device="cuda")
+
+    # Encode smaple observation
+    embedding = world_model.encode_obs(sample_obs) # B,C,T,H,W -> B,(T P), D
+    embedding = rearrange(embedding, "B (T P) D -> B T P D",B=B, T=T,D=world_model.embed_dim)
+    embedding_buffer[:, :T] = embedding
+    action_buffer[:,:T] = sample_action[:, ::world_model.tubelet_size]
+
+    for i in range(imagine_batch_length):
+        #repeat and save data
+        # 1. Get current context embedding
+        current_embedding = rearrange(
+            embedding_buffer[:, i:i+T], "B T P D -> B (T P) D"
+        )  # e.g., [B, T*P, D]
+
+        # 2. Actor use prediect latent sample action
+        with torch.no_grad():
+            # pred_embedding shape: [B, P, D] → flatten or pooled
+            action = agent.sample(current_embedding)  # ➜ [B, A]
+            
+        # 3. predict next frame embedding + reward/termination
+        current_actions = torch.cat([action_buffer[:, i:i+clip_len], action],dim=1) # [B, T, A]
+        with torch.no_grad():
+            completed_embedding, pred_embedding, reward_hat, termination_hat = \
+                world_model.step(current_embedding, current_actions)
+            
+        # 4. update buffer
+        embedding_buffer[:, i+T:i+T+1] = pred_embedding.unsqueeze(1)        # [B, 1, P, D]
+        action_buffer[:, i+T:i+T+1] = action                                # [B, 1, A]
+        reward_hat_buffer[:, i+T:i+T+1] = reward_hat.unsqueeze(1)           # [B, 1]
+        termination_hat_buffer[:, i+T:i+T+1] = termination_hat.unsqueeze(1) # [B, 1]
+
+    return  embedding_buffer[:,0:], \
+            action_buffer[:,T:], \
+            reward_hat_buffer[:,T:], \
+            termination_hat_buffer[:,T:]
 
 def train_world_model_step(
-        world_model:WorldModelBase,
+        world_model:JEPAWorldModel,
         replay_buffer:ReplayBuffer,
         batch_size,
         batch_length,
@@ -23,17 +80,19 @@ def train_world_model_step(
         log_video,
         **kwargs
     ):
-    obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length)
-    world_model.update(obs, action, reward, termination, logger=logger, log_video=log_video,**kwargs)
+    if replay_buffer.ready():
+        obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length)
+        world_model.update(obs, action, reward, termination, logger=logger, log_video=log_video,**kwargs)
 
 def world_model_imagine_data(
-        world_model:WorldModelBase,
+        world_model:JEPAWorldModel,
         replay_buffer:ReplayBuffer,
         agent:ActorCriticAgent,
         imagine_batch_size,
         imagine_batch_length,
         imagine_context_length,
         imagine_demonstration_batch_size,
+        clip_len,
         log_video,
         logger:utils.Logger,
     ):
@@ -43,17 +102,24 @@ def world_model_imagine_data(
     world_model.eval()
     agent.eval()
     obs, action, _, _ = replay_buffer.sample(imagine_batch_size, imagine_demonstration_batch_size, imagine_context_length)
-    latent, action, reward_hat, termination_hat = world_model.imagine_data(
-        agent=agent, sample_obs=obs, sample_action=action,
+    if log_video:
+        visual_obs = rearrange(obs, "B C T H W ->B T C H W")
+        logger.log("Imagine/agent_sample_video", torch.clamp(visual_obs[::imagine_batch_size//16], 0, 1).cpu().float().detach().numpy())
+
+    return imagine_data(
+        world_model=world_model ,agent=agent, sample_obs=obs, sample_action=action,
         imagine_batch_size=imagine_batch_size+imagine_demonstration_batch_size,
-        imagine_batch_length=imagine_batch_length,
+        imagine_batch_length=imagine_batch_length, clip_len=clip_len,
         log_video=log_video,
         logger=logger
     )
-    return latent, action, reward_hat, termination_hat
 
-
+mount_path_env = os.getenv('MOUNT_PATH', "")
 def main(args, resume_preempt=False):
+    # ## Test
+    # from app.world_model.unittest import main
+    # main(args, resume_preempt)
+    # return
     # >>> Set device
     if not torch.cuda.is_available():
         device = torch.device('cpu')
@@ -66,22 +132,32 @@ def main(args, resume_preempt=False):
     env_setting = args.get("Environment")
     logger_setting = args.get("logging")
     basic_setting = args.get("BasicSettings")
+    logger_path = logger_setting.get("folder")
+    log_save_path = os.path.join(mount_path_env, f"runs/{logger_path}")
+    dummy_config_path = os.path.join(mount_path_env, f"runs/{logger_path}/config.yaml")
+    ckpt_path = os.path.join(mount_path_env, f"ckpt/{logger_path}")
 
-    
     env_name = env_setting.get("task")
-    logger.init(logger_setting.get("folder"))
+    tensorboard_logger.init(log_save_path)
     num_envs = joint_train_agent.get("NumEnvs")
-    frame_skip = 4
+    frame_skip = 1
     maxpooling = True
-    
-    # >>> Create env
+
+    # >>> dump config file and create log/ckpt dir 
+    os.makedirs(ckpt_path, exist_ok=True)
+    os.makedirs(logger_path, exist_ok=True)
+    with open(dummy_config_path, "w") as f:
+        yaml.dump(args, f, default_flow_style=False)
+
+    # >>> Create env 
     vec_env = env_wrapper.build_single_env(args,frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
     action_dims = list(vec_env.action_space.nvec)
-    
+
     # >>> Build up replay buffer
     replay_buffer = utils.build_replay_buffer(
         args, action_dims, 
         device=device if basic_setting.get("ReplayBufferOnGPU") else "cpu")
+    
     if joint_train_agent.get("UseDemonstration"):
         path = joint_train_agent.get("DemonstrationPath")
         utils.logger.info(f"Loading demonstration trajectory from {path}")
@@ -114,6 +190,9 @@ def main(args, resume_preempt=False):
     imagine_context_length              = joint_train_agent.get("ImagineContextLength")
     imagine_demonstration_batch_size    = joint_train_agent.get("ImagineDemonstrationBatchSize") if joint_train_agent.get("UseDemonstration") else 0
 
+    # if True:
+    #     replay_buffer.load_buffer("test.pkl")
+
     # >>> Sample and Training 
     for total_steps in tqdm(range(max_steps//num_envs)):
         #  >>> sample part
@@ -144,9 +223,9 @@ def main(args, resume_preempt=False):
         if done_flag.any() :
             for i in range(num_envs):
                 if done_flag:
-                    logger.log(f"sample/{env_name}_reward", sum_reward[i])
-                    logger.log(f"sample/{env_name}_episode_steps", current_info["elapsed_steps"]//frame_skip)
-                    logger.log("replay_buffer/length", len(replay_buffer))
+                    tensorboard_logger.log(f"sample/{env_name}_reward", sum_reward[i])
+                    tensorboard_logger.log(f"sample/{env_name}_episode_steps", current_info["elapsed_steps"]//frame_skip)
+                    tensorboard_logger.log("replay_buffer/length", len(replay_buffer))
                     sum_reward[i] = 0
                     current_obs, current_info = vec_env.reset()
 
@@ -159,22 +238,24 @@ def main(args, resume_preempt=False):
                 batch_size=batch_size,
                 batch_length=batch_length,
                 demonstration_batch_size=demonstration_batch_size,
-                logger=logger,
+                logger=tensorboard_logger,
                 log_video=log_video,
                 step=total_steps,
                 max_steps=max_steps
             )
 
 
+
         # >>> train agent part
-        if False and replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0:
+        if replay_buffer.ready() and total_steps % (train_agent_every_steps//num_envs) == 0 and total_steps*num_envs >= 0:
             if total_steps % (save_every_steps//num_envs) == 0:
                 log_video = True
             else:
                 log_video = False
+            clip_len = 2
 
             imagine_latent, \
-            agent_action, agent_logprob, agent_value, \
+            agent_action, \
             imagine_reward, imagine_termination \
             = world_model_imagine_data(
                 replay_buffer=replay_buffer,
@@ -184,30 +265,35 @@ def main(args, resume_preempt=False):
                 imagine_batch_length=imagine_batch_length,
                 imagine_context_length=imagine_context_length,
                 imagine_demonstration_batch_size=imagine_demonstration_batch_size,
+                clip_len=clip_len,
                 log_video=log_video,
-                logger=logger
+                logger=tensorboard_logger
             )
 
             agent.update(
                 latent=imagine_latent,
                 action=agent_action,
-                old_logprob=agent_logprob,
-                old_value=agent_value,
+                old_logprob=None,
+                old_value=None,
                 reward=imagine_reward,
                 termination=imagine_termination,
-                logger=logger
+                clip_len=clip_len,
+                logger=tensorboard_logger
             )
 
         # >>> log and save model
         # Evaluate model and save best model
-        if total_steps % (eval_every_steps//num_envs) == 0 and total_steps > 0:
-            # rewards, steps = eval mdoel
-            # if reward > max_reward or steps < min_steps
-            #   save model
-            pass
+        # if total_steps % (eval_every_steps//num_envs) == 0 and total_steps > 0:
+        #     # rewards, steps = eval mdoel
+        #     # if reward > max_reward or steps < min_steps
+        #     #   save model
+        #     pass
         # save model per episode
         if total_steps % (save_every_steps//num_envs) == 0:
-            # save model
-            pass
-    logger.close()
+            utils.logger.info(f"Saving model at total steps {total_steps}")
+            torch.save(world_model.state_dict(), f"{ckpt_path}/world_model_{total_steps}.pth")
+            torch.save(agent.state_dict(), f"{ckpt_path}/agent_{total_steps}.pth")
+
+    replay_buffer.export_buffer(f"{max_steps}__sampe.pkl")
+    tensorboard_logger.close()
     vec_env.close()

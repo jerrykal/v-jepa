@@ -2,20 +2,37 @@ import copy
 import torch
 
 import src.models.vision_transformer as video_vit
-import src.models.predictor as vit_predictor
+import src.models.wm_predictor as vit_predictor
 import torch.nn.functional as F
 
 from torch import nn
+from einops import rearrange
+from typing import List, Tuple
 from src.masks.utils import apply_masks
+from src.models.utils.losses import SymLogTwoHotLoss
 from src.utils.tensors import repeat_interleave_batch
-from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
+from src.models.attentive_pooler import AttentivePooler
 from src.models.vision_transformer import VisionTransformer as ViT
 from src.models.world_models.base_world_model import WorldModelBase
-from src.models.attentive_pooler import AttentivePooler
 from src.models.world_models.DecoderHead import RewardDecoder, TerminationDecoder
-from src.models.utils.losses import SymLogTwoHotLoss, GeneralizedLpLoss
-from src.masks.multiblock3d import _MaskGenerator,_WorldModelMaskGenerator
-from typing import List, Tuple
+from src.masks.multiblock3d import _MaskGenerator,WorldModelMaskGenerator,PrediectFrameMaskGenerator
+from src.models.utils.multimask import MultiMaskWrapper, WorldModelPredictorMultiMaskWrapper
+
+
+def action_onehot_function(actions, action_dims):
+    ret = []
+    for action, dim in zip(actions, action_dims):
+        ret.append(nn.functional.one_hot(action.long(), num_classes=dim).float())
+    return ret
+
+def actions2onehot(actions ,action_dims):
+    bl_vec = []
+    for l_actions in actions: # [B ,L, action]
+        l_vec = []
+        for action in l_actions: # [L, action]
+            l_vec.append(torch.cat(action_onehot_function(action,action_dims), dim=0))
+        bl_vec.append(torch.stack(l_vec, dim=0))
+    return torch.stack(bl_vec, dim=0)
 
 def init_optimizer(
     models,  # list of torch.nn.Module
@@ -71,7 +88,7 @@ class JEPAWorldModel(WorldModelBase):
                  cfgs_mask:dict={},
 
                  use_amp=True,
-                 dtype=torch.bfloat16,
+                 dtype=torch.float16,
                  ):
         super().__init__()
         self.use_amp = use_amp
@@ -79,7 +96,9 @@ class JEPAWorldModel(WorldModelBase):
         self.reg_coeff = reg_coeff
         self.mixed_precision = (dtype==torch.bfloat16) or (dtype == torch.float16)
         self.action_dims = action_dims
-
+        self.tubelet_size = tubelet_size
+        self.img_size = image_size
+        self.patch_size = patch_size
         # Context Encoder
         encoder:ViT = video_vit.__dict__[encoder_name](
             img_size=image_size[0],
@@ -88,6 +107,7 @@ class JEPAWorldModel(WorldModelBase):
             tubelet_size=tubelet_size,
             uniform_power=uniform_power
         )
+        self.embed_dim = encoder.embed_dim
         self.context_encoder = MultiMaskWrapper(encoder)
         
         # Target Encoder
@@ -108,12 +128,15 @@ class JEPAWorldModel(WorldModelBase):
             num_mask_tokens=len(cfgs_mask),
             zero_init_mask_tokens=zero_init_mask_tokens
         )
-        self.predictor = PredictorMultiMaskWrapper(predictor)
+        self.predictor = WorldModelPredictorMultiMaskWrapper(predictor)
 
+        #frist action token
+        self.empty_action = nn.Parameter(torch.zeros(1, 1, pred_embed_dim))
         self.action_encoder = nn.Sequential(
-            nn.Linear(sum(action_dims), encoder.embed_dim),
+            nn.Linear(sum(action_dims), pred_embed_dim),
             nn.ReLU()
         )
+
         # Pooler
         self.attentive_pooler = AttentivePooler(
             num_queries=1,
@@ -140,7 +163,7 @@ class JEPAWorldModel(WorldModelBase):
         # Mask
         self.mask_generators:List[_MaskGenerator] = []
         for m in cfgs_mask:
-            mask_generator = _WorldModelMaskGenerator(
+            mask_generator = WorldModelMaskGenerator(
                 crop_size=image_size,
                 num_frames=num_frames,
                 spatial_patch_size=patch_size,
@@ -154,7 +177,19 @@ class JEPAWorldModel(WorldModelBase):
                 use_collect=False
             )
             self.mask_generators.append(mask_generator)
-
+        self.predict_mask_generator = PrediectFrameMaskGenerator(
+                crop_size=image_size,
+                num_frames=num_frames,
+                spatial_patch_size=patch_size,
+                temporal_patch_size=tubelet_size,
+                spatial_pred_mask_scale=m.get('spatial_scale'),
+                temporal_pred_mask_scale=m.get('temporal_scale'),
+                aspect_ratio=m.get('aspect_ratio'),
+                npred=m.get('num_blocks'),
+                max_context_frames_ratio=m.get('max_temporal_keep', 1.0),
+                max_keep=m.get('max_keep', None),
+                use_collect=False
+            )
         #Loss or Optimizer
         # self.mse_loss_func = GeneralizedLpLoss(loss_exp)
         self._loss_exp = loss_exp
@@ -171,20 +206,50 @@ class JEPAWorldModel(WorldModelBase):
             use_amp=self.use_amp)
         
         self.ema = ema
- 
+    def encode_obs(self,obs):
+        return self.context_encoder(obs)
+    
+    def step(self, embedding, actions):
+        # Mask
+        batch_size, TP, D = embedding.shape
+        T = TP//self.get_num_patches()
+        masks_enc, masks_pred = self.predict_mask_generator(batch_size, T)
+        _me = masks_enc.cuda()
+        _mp = masks_pred.cuda()
+        _me = repeat_interleave_batch(_me, batch_size, repeat=1)
+        _mp = repeat_interleave_batch(_mp, batch_size, repeat=1)
+        
+        # Encode action
+        actions = actions2onehot(actions, self.action_dims)
+        B, A_T, A = actions.shape
+        token = self.empty_action.expand(B, -1, -1)
+        actions_flat = actions.view(B * A_T, A)
+        encoded_action = self.action_encoder(actions_flat)
+        encoded_action = encoded_action.view(B, A_T, -1)
+        encoded_action = torch.cat([token, encoded_action[:, 1:]], dim=1)
+        
+        assert A_T == T+1 # Number of action == clip + prediect frame 
+        last_z, completed_z=self.predictor.next_frame(embedding, _me, _mp, encoded_action)
+        
+        feat = self.attentive_pooler(completed_z[0]).squeeze(1)
+        reward_hat = self.reward_decoder(feat)
+        reward_hat = self.symlog_twohot_loss_func.decode(reward_hat)
+        
+        termination_hat = self.termination_decoder(feat)
+        termination_hat = termination_hat > 0
+        return completed_z[0], last_z[0], reward_hat, termination_hat
+
+    def get_num_patches(self, num_frames=-1):
+        if num_frames == -1:
+            num_frames = self.tubelet_size
+        return (num_frames//self.tubelet_size) * (self.img_size[0] // self.patch_size) * (self.img_size[1] // self.patch_size)
+
     def get_momentum(self, step, max_steps):
         ema_start, ema_end = self.ema
         progress = min(step / max_steps, 1.0)
         return ema_start + progress * (ema_end - ema_start)
     
-    def imagine_data(self, 
-                     agent, 
-                     sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, 
-                     log_video, logger):
-        pass
-
-    def _forward_target(self, obs, masks_pred, encoded_action):
+    def _forward_target(self, obs, masks_pred):
         """
         Returns list of tensors of shape [B, N, D], one for each
         mask-pred.
@@ -202,7 +267,8 @@ class JEPAWorldModel(WorldModelBase):
         mask-pred.
         """
         z = self.context_encoder(obs, masks_enc)
-        z, compelet_z = self.predictor(z, target_feat, masks_enc, masks_pred)
+        z, compelet_z = self.predictor(z, target_feat, masks_enc, masks_pred, encoded_action)
+
         return z, compelet_z
     
     def _recon_loss_func(self, z, h, masks_pred):
@@ -216,22 +282,11 @@ class JEPAWorldModel(WorldModelBase):
     def _reg_fn(self, z):
         return sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z]) / len(z)
     
-    # def adamw_logger(optimizer):
-    #     """ logging magnitude of first and second momentum buffers in adamw """
-    #     # TODO: assert that optimizer is instance of torch.optim.AdamW
-    #     state = optimizer.state_dict().get('state')
-    #     exp_avg_stats = AverageMeter()
-    #     exp_avg_sq_stats = AverageMeter()
-    #     for key in state:
-    #         s = state.get(key)
-    #         exp_avg_stats.update(float(s.get('exp_avg').abs().mean()))
-    #         exp_avg_sq_stats.update(float(s.get('exp_avg_sq').abs().mean()))
-    #     return {'exp_avg': exp_avg_stats, 'exp_avg_sq': exp_avg_sq_stats}
-
     def update(self, obs, actions, reward, termination, logger=None, log_video=False, **kwargs):
         self.train()
         batch_size, batch_length = obs.shape[:2]
-
+        visual_obs = obs.cpu().float().detach()
+        self.target_encoder.eval()
         try:
             step = kwargs["step"]
             max_steps = kwargs["max_steps"]
@@ -240,10 +295,13 @@ class JEPAWorldModel(WorldModelBase):
 
         with torch.autocast(device_type='cuda', dtype=self.dtype, enabled=self.use_amp):
             # Encode action
-            B, T, A = actions.shape
+            actions = actions2onehot(actions[:,::self.tubelet_size], self.action_dims)
+            B, T, A = actions.shape 
+            token = self.empty_action.expand(B, -1, -1)
             actions_flat = actions.view(B * T, A)
             encoded_action = self.action_encoder(actions_flat)
             encoded_action = encoded_action.view(B, T, -1)
+            encoded_action = torch.cat([token, encoded_action[:, :-1]], dim=1) 
 
             # update mask
             collated_masks_enc, collated_masks_pred  = [], []
@@ -263,16 +321,15 @@ class JEPAWorldModel(WorldModelBase):
                 _masks_enc.append(_me)
                 _masks_pred.append(_mp)
 
-            # Step 1. Forward
             # JEPA Reconstruction Loss
             loss_jepa, loss_reg = 0., 0.
-            h, _ = self._forward_target(obs, _masks_pred, encoded_action)
+            h, _ = self._forward_target(obs, _masks_pred)
             z, completed_z = self._forward_context(obs, h, _masks_enc, _masks_pred, encoded_action)
             loss_jepa = self._recon_loss_func(z, h, _masks_pred)  # jepa prediction loss
             pstd_z = self._reg_fn(z)  # predictor variance across patches
             loss_reg += torch.mean(F.relu(1.-pstd_z))
             
-            temporl_z = completed_z[1] #Temporl mask predict
+            temporl_z = completed_z[-1] #Temporl mask predict
             feat = self.attentive_pooler(temporl_z).squeeze(1)
             reward_hat = self.reward_decoder(feat)
             termination_hat = self.termination_decoder(feat)
@@ -280,7 +337,7 @@ class JEPAWorldModel(WorldModelBase):
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward[:,-1].squeeze())
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination[:,-1].squeeze())
 
-            loss = loss_jepa + self.reg_coeff * loss_reg + reward_loss + termination_loss
+            loss = loss_jepa + self.reg_coeff * loss_reg #+ reward_loss + termination_loss
             # Step 2. Backward & step
             if self.mixed_precision:
                 self.scaler.scale(loss).backward()
@@ -299,12 +356,12 @@ class JEPAWorldModel(WorldModelBase):
             else:
                 self.optimizer.step()
             
-            # grad_stats = grad_logger(encoder.named_parameters())
+            self.optimizer.zero_grad()
+            # grad_stats = grad_logger(self.context_encoder.named_parameters())
             # grad_stats.global_norm = float(_enc_norm)
             # grad_stats_pred = grad_logger(predictor.named_parameters())
             # grad_stats_pred.global_norm = float(_pred_norm)
-            self.optimizer.zero_grad()
-            # optim_stats = adamw_logger(self.optimizer)
+            # optim_stats = self.adamw_logger(self.optimizer)
 
             # Step 3. momentum update of target encoder
             m = self.get_momentum(step=step,max_steps=max_steps)
@@ -312,19 +369,24 @@ class JEPAWorldModel(WorldModelBase):
                 for param_q, param_k in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
                     param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
 
-
+            if logger is not None:
+                logger.log("WorldModel/loss_jepa", loss_jepa.item())
+                logger.log("WorldModel/loss_reg", loss_reg.item())
+                logger.log("WorldModel/reward_loss", reward_loss.item())
+                logger.log("WorldModel/termination_loss", termination_loss.item())
+                logger.log("WorldModel/total_loss", loss.item())
+                if log_video:
+                    visual_obs = rearrange(visual_obs, "B C T H W ->B T C H W")
+                    logger.log("Recon/world_sample_video", torch.clamp(visual_obs[::batch_size//2], 0, 1).numpy())
+            
 def test_jepa_world_model():
+    import numpy as np
     batch_size = 2
     time_steps = 16
     img_size = (224, 224)
     patch_size = 16
     tubelet_size = 2
     channels = 3
-
-    obs = torch.randn(batch_size, channels, time_steps, *img_size)  # [B, C, T, H, W]
-    actions = torch.randn(batch_size, time_steps, 4)  
-    rewards = torch.randint(0, 2, (batch_size, time_steps)).float()
-    terminations = torch.randint(0, 2, (batch_size, time_steps)).float()
 
     cfgs_mask = [{
         "spatial_scale": (0.15, 0.15),
@@ -343,9 +405,21 @@ def test_jepa_world_model():
         "max_keep": None,
         
     }]
-
+    action_dims=[12,3]
+    # >>> Build up replay buffer
+    from app.world_model.replay_buffer import ReplayBuffer
+    replay_buffer = ReplayBuffer(
+        obs_shape=(img_size[0], img_size[1], 3),
+        action_dim=action_dims,
+        num_envs=1,
+        max_length=100000,
+        warmup_length=500,
+        device='cpu',
+    )
+    replay_buffer.load_buffer("test.pkl")
+    
     model = JEPAWorldModel(
-        action_dims=[4],
+        action_dims=action_dims,
         encoder_name="vit_small",
         image_size=img_size,
         patch_size=patch_size,
@@ -358,7 +432,8 @@ def test_jepa_world_model():
 
     step = 1000
     max_steps = 100000
-
+    
+    obs, actions, rewards, terminations = replay_buffer.sample(batch_size, 0, 16)
     model.update(
         obs=obs.cuda(),
         actions=actions.cuda(),

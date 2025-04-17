@@ -13,7 +13,8 @@ def get_3d_sincos_pos_embed(
     grid_size,
     grid_depth,
     cls_token=False,
-    uniform_power=False
+    uniform_power=False,
+    include_action_tokens=False,
 ):
     """
     grid_size: int of the grid height and width
@@ -41,6 +42,13 @@ def get_3d_sincos_pos_embed(
     pos_embed = pos_embed[:, :embed_dim]
     if cls_token:
         pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+
+    if include_action_tokens:
+        # For each frame (grid_depth), add a 1D temporal encoding as action pos
+        action_grid = np.arange(grid_depth, dtype=float)
+        action_pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, action_grid)  # [T', D]
+        pos_embed = np.concatenate([pos_embed, action_pos_embed], axis=0)
+        
     return pos_embed
 
 

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from einops import rearrange
 import pickle
-
+import torch.nn as nn
 
 class ReplayBuffer():
     def __init__(self, 
@@ -24,7 +24,7 @@ class ReplayBuffer():
             self.termination_buffer = torch.empty(self._termination_shape, dtype=torch.float32, device=device, requires_grad=False)
         else:
             self.obs_buffer = np.empty(self._obs_shape, dtype=np.uint8)
-            self.action_buffer = np.empty(self._action_shape, dtype=np.uint8)
+            self.action_buffer = np.empty(self._action_shape, dtype=np.float32)
             self.reward_buffer = np.empty(self._reward_shape, dtype=np.float32)
             self.termination_buffer = np.empty(self._termination_shape, dtype=np.float32)
 
@@ -103,7 +103,7 @@ class ReplayBuffer():
                 termination.append(external_termination)
 
             obs = torch.cat(obs, dim=0).float()
-            obs = rearrange(obs, "B T H W C -> B T C H W")
+            obs = rearrange(obs, "B T H W C -> B C T H W")
             action = torch.cat(action, dim=0)
             reward = torch.cat(reward, dim=0)
             termination = torch.cat(termination, dim=0)
@@ -126,7 +126,7 @@ class ReplayBuffer():
                 termination.append(external_termination)
 
             obs = torch.from_numpy(np.concatenate(obs, axis=0)).float().cuda() / 255
-            obs = rearrange(obs, "B T H W C -> B T C H W")
+            obs = rearrange(obs, "B T H W C -> B C T H W")
             action = torch.from_numpy(np.concatenate(action, axis=0)).cuda()
             reward = torch.from_numpy(np.concatenate(reward, axis=0)).cuda()
             termination = torch.from_numpy(np.concatenate(termination, axis=0)).cuda()
@@ -154,6 +154,51 @@ class ReplayBuffer():
 
         if len(self) < self.max_length:
             self.length += 1
+
+    def export_buffer(self, file_path):
+        if self.store_on_gpu:
+            buffer = {
+                "obs": self.obs_buffer[:self.length].cpu().numpy(),
+                "action": self.action_buffer[:self.length].cpu().numpy(),
+                "reward": self.reward_buffer[:self.length].cpu().numpy(),
+                "done": self.termination_buffer[:self.length].cpu().numpy(),
+            }
+        else:
+            buffer = {
+                "obs": self.obs_buffer[:self.length],
+                "action": self.action_buffer[:self.length],
+                "reward": self.reward_buffer[:self.length],
+                "done": self.termination_buffer[:self.length],
+            }
+        with open(file_path, "wb") as f:
+            pickle.dump(buffer, f)
+        print(f"Buffer exported to {file_path}")
+
+    def load_buffer(self, file_path):
+        with open(file_path, "rb") as f:
+            buffer = pickle.load(f)
+
+        obs = buffer["obs"]
+        action = buffer["action"]
+        reward = buffer["reward"]
+        done = buffer["done"]
+
+        self.length = obs.shape[0]
+        self.external_buffer_length = None  # reset
+        self.last_pointer = self.length - 1
+
+        if self.store_on_gpu:
+            self.obs_buffer[:self.length] = torch.from_numpy(obs).to(self.device)
+            self.action_buffer[:self.length] = torch.from_numpy(action).to(self.device)
+            self.reward_buffer[:self.length] = torch.from_numpy(reward).to(self.device)
+            self.termination_buffer[:self.length] = torch.from_numpy(done).to(self.device)
+        else:
+            self.obs_buffer[:self.length] = obs
+            self.action_buffer[:self.length] = action
+            self.reward_buffer[:self.length] = reward
+            self.termination_buffer[:self.length] = done
+
+        print(f"Buffer loaded from {file_path}, length={self.length}")
 
     def __len__(self):
         return self.length * self.num_envs

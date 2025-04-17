@@ -16,44 +16,53 @@ import numpy as np
 
 from tensorboardX import SummaryWriter
 from app.world_model.replay_buffer import ReplayBuffer
-from src.models.world_models.base_world_model import WorldModelBase
+from src.models.world_models.jepa_world_model import JEPAWorldModel
 from src.models.agents.agents import ActorCriticAgent
 
 
 CONFIG_VERSION = "0.00.0.beta"
 
 
-def build_world_model(params, action_dims, device)->WorldModelBase:
-    from src.models.world_models.jepa_world_model import JEPAWorldModel
-    cfgs_model = params.get("Models")
-    cfgs_env = params.get("Environment")
+def build_world_model(params, action_dims, device)->JEPAWorldModel:
+    cfgs_model = params.get("Models").get("WorldModel")
     cfgs_mask = params["mask"]
-
+    
     wm = JEPAWorldModel(
         action_dims=action_dims,
-        encoder_name="vit_small",
-        image_size=(224,224),
-        patch_size=16,
-        num_frames=16,
-        tubelet_size=4,
-        uniform_power=False,
+        encoder_name=cfgs_model["encoder_name"],
+        image_size=cfgs_model["image_size"],
+        patch_size=cfgs_model["patch_size"],
+        num_frames=cfgs_model["num_frames"],
+        tubelet_size=cfgs_model["tubelet_size"],
+        uniform_power=cfgs_model["uniform_power"],
 
-        use_mask_tokens=True,
-        pred_embed_dim=384,
-        pred_depth=12,
-        zero_init_mask_tokens=True,
-        loss_exp=1.0,
-        reg_coeff=0.0,
-        ema=(0.998, 1.0),
+        use_mask_tokens=cfgs_model["use_mask_tokens"],
+        pred_embed_dim=cfgs_model["pred_embed_dim"],
+        pred_depth=cfgs_model["pred_depth"],
+        zero_init_mask_tokens=cfgs_model["zero_init_mask_tokens"],
+        loss_exp=cfgs_model["loss_exp"],
+        reg_coeff=cfgs_model["reg_coeff"],
+        ema=cfgs_model["ema"],
 
         cfgs_mask=cfgs_mask,
 
         use_amp=True,
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
     )
     return wm.to(device=device)
+
 def build_agent(params, action_dim, device)->ActorCriticAgent:
-    pass
+    cfgs_model = params.get("Models").get("Agent")
+    cfgs_env = params.get("Environment")
+    return ActorCriticAgent(
+        feat_dim=sum(cfgs_model["InputFeature"]),
+        num_layers=cfgs_model["NumLayers"],
+        hidden_dim=cfgs_model["HiddenDim"],
+        action_dim=action_dim,
+        gamma=float(cfgs_model["Gamma"]),
+        lambd=float(cfgs_model["Lambda"]),
+        entropy_coef=float(cfgs_model["EntropyCoef"]),
+    ).to(device=device)
 
 def build_replay_buffer(params, action_dims, device="cpu"):
     task_parameter = params.get("Environment").get("task_parameter")

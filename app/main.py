@@ -49,9 +49,9 @@ def process_main(rank, fname, world_size, devices):
     if rank == 0:
         os.makedirs(params['logging']['folder'], exist_ok=True)
         pprint.PrettyPrinter(indent=4).pprint(params)
-        dump = os.path.join(params['logging']['folder'], 'params.yaml')
-        with open(dump, 'w') as f:
-            yaml.dump(params, f)
+        # dump = os.path.join(params['logging']['folder'], 'params.yaml')
+        # with open(dump, 'w') as f:
+        #     yaml.dump(params, f)
 
     # Init distributed (access to comm between GPUS on same machine)
     world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
