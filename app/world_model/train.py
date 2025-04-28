@@ -9,8 +9,8 @@ from libs import env_wrapper
 from tqdm import tqdm
 from collections import deque
 from app.world_model import utils
-from src.models.agents.agents import ActorCriticAgent
 from app.world_model.replay_buffer import ReplayBuffer
+from src.models.agents.agents import ActorCriticAgent
 from src.models.world_models.jepa_world_model import JEPAWorldModel
 
 #Tensorboard Logger
@@ -157,10 +157,12 @@ def main(args, resume_preempt=False):
     replay_buffer = utils.build_replay_buffer(
         args, action_dims, 
         device=device if basic_setting.get("ReplayBufferOnGPU") else "cpu")
-    
+    replay_buffer.load_buffer("/home/cgv/Documents/project/EmbodiedAgent/v-jepa/CombatSpider_sampe.npz")
+
     if joint_train_agent.get("UseDemonstration"):
         path = joint_train_agent.get("DemonstrationPath")
-        utils.logger.info(f"Loading demonstration trajectory from {path}")
+        print(f"Loading demonstration trajectory from {path}")
+        # utils.logger.info(f"Loading demonstration trajectory from {path}")
         replay_buffer.load_trajectory(path=path)
 
     # >>> Build up model
@@ -190,18 +192,15 @@ def main(args, resume_preempt=False):
     imagine_context_length              = joint_train_agent.get("ImagineContextLength")
     imagine_demonstration_batch_size    = joint_train_agent.get("ImagineDemonstrationBatchSize") if joint_train_agent.get("UseDemonstration") else 0
 
-    # if True:
-    #     replay_buffer.load_buffer("test.pkl")
-
     # >>> Sample and Training 
     for total_steps in tqdm(range(max_steps//num_envs)):
         #  >>> sample part
         if replay_buffer.ready():
-            # world_model.eval()
-            # agent.eval()
+            world_model.eval()
+            agent.eval()
             # with torch.no_grad():
-            #     # emb_code = world model encode 
-            #     # actio = agent.sample(emb_code, greedy=False)
+                # embedding = world_model.encode_obs(torch.from_numpy(context_obs)) # B,C,T,H,W -> B,(T P), D
+                # action = agent.sample(embedding, greedy=False) # ➜ [B, A]
             action = vec_env.action_space.sample()
         else:
             action = vec_env.action_space.sample()
@@ -230,7 +229,7 @@ def main(args, resume_preempt=False):
                     current_obs, current_info = vec_env.reset()
 
         # >>> train world model part
-        if replay_buffer.ready() and (total_steps < 2500 or total_steps % (train_dynamics_every_steps//num_envs) == 0):
+        if replay_buffer.ready() and (total_steps % (train_dynamics_every_steps//num_envs) == 0):
             log_video = total_steps % (save_every_steps//num_envs) == 0
             train_world_model_step(
                 world_model=world_model,
@@ -252,7 +251,7 @@ def main(args, resume_preempt=False):
                 log_video = True
             else:
                 log_video = False
-            clip_len = 2
+            clip_len = imagine_context_length//world_model.tubelet_size
 
             imagine_latent, \
             agent_action, \
@@ -289,11 +288,12 @@ def main(args, resume_preempt=False):
         #     #   save model
         #     pass
         # save model per episode
-        if total_steps % (save_every_steps//num_envs) == 0:
-            utils.logger.info(f"Saving model at total steps {total_steps}")
+        if total_steps % (save_every_steps//num_envs) == 0 and total_steps > 0:
+            print(f"Saving model at total steps {total_steps}")
+            # utils.logger.info(f"Saving model at total steps {total_steps}")
             torch.save(world_model.state_dict(), f"{ckpt_path}/world_model_{total_steps}.pth")
             torch.save(agent.state_dict(), f"{ckpt_path}/agent_{total_steps}.pth")
+            replay_buffer.export_buffer(f"{env_name}_sampe")
 
-    replay_buffer.export_buffer(f"{max_steps}__sampe.pkl")
     tensorboard_logger.close()
     vec_env.close()

@@ -1,5 +1,5 @@
 MINEDOJO_HEADLESS=1 python -m app.main \
-  --fname experiments/world_model/100K-CombatSpider-JEPA.yaml \
+  --fname experiments/world_model/100K-CombatSpider-Test.yaml \
   --devices cuda:0
 
 # python -m app.main \

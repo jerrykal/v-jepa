@@ -2,7 +2,6 @@ import numpy as np
 import torch
 from einops import rearrange
 import pickle
-import torch.nn as nn
 
 class ReplayBuffer():
     def __init__(self, 
@@ -157,26 +156,25 @@ class ReplayBuffer():
 
     def export_buffer(self, file_path):
         if self.store_on_gpu:
-            buffer = {
-                "obs": self.obs_buffer[:self.length].cpu().numpy(),
-                "action": self.action_buffer[:self.length].cpu().numpy(),
-                "reward": self.reward_buffer[:self.length].cpu().numpy(),
-                "done": self.termination_buffer[:self.length].cpu().numpy(),
-            }
+            obs = self.obs_buffer[:self.length].cpu().numpy()
+            action = self.action_buffer[:self.length].cpu().numpy()
+            reward = self.reward_buffer[:self.length].cpu().numpy()
+            done = self.termination_buffer[:self.length].cpu().numpy()
         else:
-            buffer = {
-                "obs": self.obs_buffer[:self.length],
-                "action": self.action_buffer[:self.length],
-                "reward": self.reward_buffer[:self.length],
-                "done": self.termination_buffer[:self.length],
-            }
-        with open(file_path, "wb") as f:
-            pickle.dump(buffer, f)
-        print(f"Buffer exported to {file_path}")
+            obs = self.obs_buffer[:self.length]
+            action = self.action_buffer[:self.length]
+            reward = self.reward_buffer[:self.length]
+            done = self.termination_buffer[:self.length]
+
+        np.savez_compressed(file_path,
+                            obs=obs,
+                            action=action,
+                            reward=reward,
+                            done=done)
+        print(f"Buffer exported to {file_path} (npz compressed)")
 
     def load_buffer(self, file_path):
-        with open(file_path, "rb") as f:
-            buffer = pickle.load(f)
+        buffer = np.load(file_path)
 
         obs = buffer["obs"]
         action = buffer["action"]

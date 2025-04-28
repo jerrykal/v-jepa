@@ -22,6 +22,23 @@ def apply_masks(x, masks, concat=True):
 
     return torch.cat(all_x, dim=0)
 
+def apply_masks_ragged(x, masks, concat=True):
+    B, N, D = x.shape
+    result = []
+
+    for m in masks:  # mask_type: List[Tensor], length = B
+        masked_samples = []
+        for b_idx, mask in enumerate(m):
+            selected = x[b_idx].index_select(0, mask)  # shape [K_i, D]
+            masked_samples.append(selected)
+        result.append(masked_samples)
+
+    if not concat:
+        return result
+
+    flat_result = [sample for mask_type in result for sample in mask_type]
+    return torch.cat(flat_result, dim=0)
+
 def apply_masks_skip_action(x, masks, patch_per_frame, concat=True):
     """
     :param x: tensor of shape [B (batch-size), N (num-patches), D (feature-dim)]

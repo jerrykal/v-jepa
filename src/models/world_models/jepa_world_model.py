@@ -15,7 +15,7 @@ from src.models.attentive_pooler import AttentivePooler
 from src.models.vision_transformer import VisionTransformer as ViT
 from src.models.world_models.base_world_model import WorldModelBase
 from src.models.world_models.DecoderHead import RewardDecoder, TerminationDecoder
-from src.masks.multiblock3d import _MaskGenerator,WorldModelMaskGenerator,PrediectFrameMaskGenerator
+from src.masks.multiblock3d import _MaskGenerator, WorldModelMaskGenerator, PrediectFrameMaskGenerator
 from src.models.utils.multimask import MultiMaskWrapper, WorldModelPredictorMultiMaskWrapper
 
 
@@ -86,7 +86,7 @@ class JEPAWorldModel(WorldModelBase):
                  ema:Tuple[float]=(0.998, 1.0),
 
                  cfgs_mask:dict={},
-
+                 jepa_pretrain:str=None,
                  use_amp=True,
                  dtype=torch.float16,
                  ):
@@ -129,7 +129,8 @@ class JEPAWorldModel(WorldModelBase):
             zero_init_mask_tokens=zero_init_mask_tokens
         )
         self.predictor = WorldModelPredictorMultiMaskWrapper(predictor)
-
+        if jepa_pretrain: self.load_jepa_dict(jepa_pretrain)
+        
         #frist action token
         self.empty_action = nn.Parameter(torch.zeros(1, 1, pred_embed_dim))
         self.action_encoder = nn.Sequential(
@@ -249,6 +250,37 @@ class JEPAWorldModel(WorldModelBase):
         progress = min(step / max_steps, 1.0)
         return ema_start + progress * (ema_end - ema_start)
     
+    def load_jepa_dict(self, r_path):
+        def add_module_prefix(state_dict):
+            return {"module." + k: v for k, v in state_dict.items()}
+        try:
+            print(f'read-path: {r_path}')
+            checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
+        except Exception as e:
+            print(f'Encountered exception when loading checkpoint {e}')
+
+        try:
+
+            print(list(checkpoint.keys()))
+            # -- loading encoder
+            # print(list(checkpoint['encoder'].keys()))
+            # print(list(self.context_encoder.state_dict().keys()))
+            pretrained_dict = add_module_prefix(checkpoint['encoder'])
+            msg = self.context_encoder.load_state_dict(pretrained_dict, strict=False)
+
+            # -- loading predictor
+            pretrained_dict = add_module_prefix(checkpoint['predictor'])
+            msg = self.predictor.load_state_dict(pretrained_dict, strict=False)
+
+            # -- loading target_encoder
+            pretrained_dict = add_module_prefix(checkpoint['target_encoder'])
+            msg = self.target_encoder.load_state_dict(pretrained_dict, strict=False)
+
+            del checkpoint
+
+        except Exception as e:
+            print(f'Encountered exception when loading checkpoint {e}')
+
     def _forward_target(self, obs, masks_pred):
         """
         Returns list of tensors of shape [B, N, D], one for each
@@ -304,7 +336,7 @@ class JEPAWorldModel(WorldModelBase):
             encoded_action = torch.cat([token, encoded_action[:, :-1]], dim=1) 
 
             # update mask
-            collated_masks_enc, collated_masks_pred  = [], []
+            collated_masks_enc, collated_masks_pred  = [], [] # Store each mask generator preducal mask and generate a mask per batch element
             for i, mask_generator in enumerate(self.mask_generators):
                 masks_enc, masks_pred = mask_generator(batch_size)
                 collated_masks_enc.append(masks_enc)
@@ -314,8 +346,8 @@ class JEPAWorldModel(WorldModelBase):
             # same mask pair for each clip
             _masks_enc, _masks_pred = [], []
             for _me, _mp in zip(collated_masks_enc, collated_masks_pred):
-                _me = _me.cuda()
-                _mp = _mp.cuda()
+                _me = _me.to(obs.device, non_blocking=True)
+                _mp = _mp.to(obs.device, non_blocking=True)
                 _me = repeat_interleave_batch(_me, batch_size, repeat=1)
                 _mp = repeat_interleave_batch(_mp, batch_size, repeat=1)
                 _masks_enc.append(_me)
@@ -337,7 +369,7 @@ class JEPAWorldModel(WorldModelBase):
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward[:,-1].squeeze())
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination[:,-1].squeeze())
 
-            loss = loss_jepa + self.reg_coeff * loss_reg #+ reward_loss + termination_loss
+            loss = loss_jepa + self.reg_coeff * loss_reg + reward_loss + termination_loss
             # Step 2. Backward & step
             if self.mixed_precision:
                 self.scaler.scale(loss).backward()
@@ -364,6 +396,7 @@ class JEPAWorldModel(WorldModelBase):
             # optim_stats = self.adamw_logger(self.optimizer)
 
             # Step 3. momentum update of target encoder
+            # if step % 50 == 0:
             m = self.get_momentum(step=step,max_steps=max_steps)
             with torch.no_grad():
                 for param_q, param_k in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):

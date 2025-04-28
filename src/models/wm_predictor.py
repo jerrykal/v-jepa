@@ -47,11 +47,13 @@ class VisionTransformerPredictor(nn.Module):
     ):
         super().__init__()
         # Map input to predictor dimension
+        self.embed_dim = predictor_embed_dim
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
         # Mask tokens
         self.mask_tokens = None
         self.num_mask_tokens = 0
+
         if use_mask_tokens:
             self.num_mask_tokens = num_mask_tokens
             self.mask_tokens = nn.ParameterList([
@@ -205,9 +207,12 @@ class VisionTransformerPredictor(nn.Module):
 
         # Map target tokens to predictor dimensions & add noise (fwd diffusion)
         if self.mask_tokens is None:
-            pass
+            # pass
             # pred_tokens = self.predictor_embed(tgt)
-            # pred_tokens = self.diffusion(pred_tokens)
+            # pred_tokens = self.diffusion(pred_tokens) 
+            # B, N, D = tgt.shape[0], tgt.shape[1], self.predictor_embed.out_features
+            pred_tokens = torch.randn(batch_size, self.num_patches, self.embed_dim, device=x.device)
+            pred_tokens = apply_masks_skip_action(pred_tokens, masks_tgt, patch_per_frame=(self.input_size // self.patch_size)**2)
         else:
             mask_index = mask_index % self.num_mask_tokens
             pred_tokens = self.mask_tokens[mask_index]

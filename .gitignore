@@ -6,3 +6,4 @@ ckpt/*
 experiments/*
 *.log
 *.pkl
+*.npz

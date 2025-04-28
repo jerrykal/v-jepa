@@ -283,31 +283,39 @@ class WorldModelMaskGenerator(_MaskGenerator):
 
         collated_masks_pred, collated_masks_enc = [], []
         min_keep_enc = min_keep_pred = self.duration * self.height * self.width
-        
-        empty_context = True
-        while empty_context:
+        for _ in range(batch_size):
 
-            mask_e = torch.ones((self.duration, self.height, self.width), dtype=torch.int32)
-            for _ in range(self.npred):
-                mask_e *= self._sample_block_mask(p_size)
-            mask_e = mask_e.flatten()
+            empty_context = True
+            while empty_context:
 
-            mask_p = torch.argwhere(mask_e == 0).squeeze()
-            mask_e = torch.nonzero(mask_e).squeeze()
+                mask_e = torch.ones((self.duration, self.height, self.width), dtype=torch.int32)
+                for _ in range(self.npred):
+                    mask_e *= self._sample_block_mask(p_size)
+                mask_e = mask_e.flatten()
 
-            empty_context = len(mask_e) == 0
-            if not empty_context:
-                min_keep_pred = min(min_keep_pred, len(mask_p))
-                min_keep_enc = min(min_keep_enc, len(mask_e))
-                collated_masks_pred.append(mask_p)
-                collated_masks_enc.append(mask_e)
+                mask_p = torch.argwhere(mask_e == 0).squeeze()
+                mask_e = torch.nonzero(mask_e).squeeze()
 
-        for _ in range(1,batch_size):
-            collated_masks_pred.append(mask_p)
-            collated_masks_enc.append(mask_e)
-
+                empty_context = len(mask_e) == 0
+                if not empty_context:
+                    min_keep_pred = min(min_keep_pred, len(mask_p))
+                    min_keep_enc = min(min_keep_enc, len(mask_e))
+                    collated_masks_pred.append(mask_p)
+                    collated_masks_enc.append(mask_e)
+                    
         if self.max_keep is not None:
             min_keep_enc = min(min_keep_enc, self.max_keep)
+        # context_keep = 1
+        # for _ in range(batch_size):
+        #     indices = torch.randperm(self.height*self.width)
+
+        #     mask_e = indices[:context_keep]
+        #     mask_p = indices[context_keep:]
+
+        #     collated_masks_enc.append(mask_e)
+        #     collated_masks_pred.append(mask_p)
+        # if self.max_keep is not None:
+        #     min_keep_enc = min(min_keep_enc, self.max_keep)
 
 
         collated_masks_pred = [cm[:min_keep_pred] for cm in collated_masks_pred]

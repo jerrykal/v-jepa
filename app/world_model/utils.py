@@ -45,7 +45,7 @@ def build_world_model(params, action_dims, device)->JEPAWorldModel:
         ema=cfgs_model["ema"],
 
         cfgs_mask=cfgs_mask,
-
+        jepa_pretrain=params.get("pretrain"),
         use_amp=True,
         dtype=torch.float32,
     )
@@ -103,8 +103,8 @@ def seed_np_torch(seed=20010105):
     torch.backends.cudnn.benchmark = False
 
 
-logging.basicConfig(stream=sys.stdout, level=logging.WARNING)
-logger = logging.getLogger()
+# logging.basicConfig(stream=sys.stdout, level=logging.WARNING)
+# logger = logging.getLogger()
 
 class Logger():
     def __init__(self) -> None:
