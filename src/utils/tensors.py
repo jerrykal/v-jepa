@@ -9,6 +9,7 @@ import math
 
 import torch
 
+from einops import rearrange
 from logging import getLogger
 
 logger = getLogger()
@@ -69,3 +70,26 @@ def repeat_interleave_batch(x, B, repeat):
         for i in range(N)
     ], dim=0)
     return x
+
+def pool_sliding_window(latent, clip_len, pooler):
+    """
+    latent: [B, T_full, P, D]
+    clip_len: T
+    pooler: input [B * num_clips, T * P, D] → output [B * num_clips, D]
+    return: [B, num_clips, D]
+    """
+    B, T_full, P, D = latent.shape
+    num_clips = T_full - clip_len + 1
+    assert num_clips > 0, "clip_len too long, can't do sliding window"
+
+    windows = []  # sliding clip
+    for t in range(num_clips):
+        clip = latent[:, t:t+clip_len]  # shape: [B, T, P, D]
+        clip = rearrange(clip, "B T P D -> B (T P) D")
+        windows.append(clip)
+
+    latent = torch.cat(windows, dim=0)  # shape: [B * num_clips, T*P, D]
+    pooled = pooler(latent).squeeze(1)  # → [B * num_clips, D]
+
+    latent = rearrange(pooled, "(B C) D -> B C D", B=B, C=num_clips)
+    return latent  

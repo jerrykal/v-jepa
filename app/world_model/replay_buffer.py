@@ -176,14 +176,14 @@ class ReplayBuffer():
     def load_buffer(self, file_path):
         buffer = np.load(file_path)
 
-        obs = buffer["obs"]
-        action = buffer["action"]
-        reward = buffer["reward"]
-        done = buffer["done"]
-
-        self.length = obs.shape[0]
+        self.length = buffer["obs"].shape[0]//2
         self.external_buffer_length = None  # reset
         self.last_pointer = self.length - 1
+
+        obs = buffer["obs"][:self.length]
+        action = buffer["action"][:self.length]
+        reward = buffer["reward"][:self.length]
+        done = buffer["done"][:self.length]
 
         if self.store_on_gpu:
             self.obs_buffer[:self.length] = torch.from_numpy(obs).to(self.device)
@@ -195,8 +195,8 @@ class ReplayBuffer():
             self.action_buffer[:self.length] = action
             self.reward_buffer[:self.length] = reward
             self.termination_buffer[:self.length] = done
-
         print(f"Buffer loaded from {file_path}, length={self.length}")
+
 
     def __len__(self):
         return self.length * self.num_envs

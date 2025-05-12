@@ -31,7 +31,7 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
+    def __init__(self, feat_len, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
         super().__init__()
         self.action_dim = action_dim
         self.gamma = gamma
@@ -40,6 +40,7 @@ class ActorCriticAgent(nn.Module):
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
+        self.feat_len = feat_len
 
         #  Pooler
         self.attentive_pooler = AttentivePooler(
@@ -47,15 +48,16 @@ class ActorCriticAgent(nn.Module):
             embed_dim=feat_dim,
             num_heads=12,
             mlp_ratio=4.0,
-            depth=1,
+            depth=2,
             norm_layer=nn.LayerNorm,
             init_std=0.02,
             qkv_bias=True,
             complete_block=True,
         )
+
         # Actor network
         actor = [
-            nn.Linear(feat_dim, hidden_dim, bias=False),
+            nn.Linear(feat_len*feat_dim, hidden_dim, bias=False),
             nn.RMSNorm(hidden_dim),
             nn.SiLU(inplace=True)
         ]
@@ -75,7 +77,7 @@ class ActorCriticAgent(nn.Module):
 
         # Critic network
         critic = [
-            nn.Linear(feat_dim, hidden_dim, bias=False),
+            nn.Linear(feat_len*feat_dim, hidden_dim, bias=False),
             nn.RMSNorm(hidden_dim),
             nn.SiLU(inplace=True)
         ]
@@ -127,7 +129,10 @@ class ActorCriticAgent(nn.Module):
     def sample(self, latent, greedy=False):
         self.eval()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            latent = self.attentive_pooler(latent)
+            B, T, P, D = latent.shape
+            latent = rearrange(latent,"B T P D -> (B T) P D")
+            latent = self.attentive_pooler(latent).squeeze(1)
+            latent = rearrange(latent,"(B T) D -> B (T D)", T=T)
             logits = self.policy(latent)
             dist = self.dist_fn(logits)
             if greedy:
@@ -140,27 +145,22 @@ class ActorCriticAgent(nn.Module):
         action = self.sample(latent, greedy)
         return action.detach().cpu().squeeze(-1).numpy()
     
-    def pool_sliding_window(self, latent, clip_len, pooler):
+    def pool_sliding_window(self, latent, clip_len):
         """
         latent: [B, T_full, P, D]
         clip_len: T
-        pooler: input [B * num_clips, T * P, D] → output [B * num_clips, D]
         return: [B, num_clips, D]
         """
         B, T_full, P, D = latent.shape
         num_clips = T_full - clip_len + 1
         assert num_clips > 0, "clip_len too long, can't do sliding window"
 
-        windows = []  # 每個 sliding clip
-        for t in range(num_clips):
-            clip = latent[:, t:t+clip_len]  # shape: [B, T, P, D]
-            clip = rearrange(clip, "B T P D -> B (T P) D")
-            windows.append(clip)
+        latent = rearrange(latent,"B T P D -> (B T) P D")
+        latent = self.attentive_pooler(latent).squeeze(1)
+        latent = rearrange(latent,"(B T) D -> B T D", T=T_full)
 
-        latent = torch.cat(windows, dim=0)  # shape: [B * num_clips, T*P, D]
-        pooled = pooler(latent).squeeze(1)  # → [B * num_clips, D]
-
-        latent = rearrange(pooled, "(B C) D -> B C D", B=B, C=num_clips)
+        windows = [rearrange(latent[:, t:t+clip_len], "B T D -> B 1 (T D)") for t in range(num_clips)]  
+        latent = torch.cat(windows, dim=1)  
         return latent
     
     def update(self, latent, action, old_logprob, old_value, reward, termination, clip_len, logger=None):
@@ -173,7 +173,7 @@ class ActorCriticAgent(nn.Module):
             # logits.shape:torch.Size([64, 17, 15])
             # action:torch.Size([64, 16, 2])
             # log_prob.shape:torch.Size([64, 16])
-            latent = self.pool_sliding_window(latent, clip_len, self.attentive_pooler)
+            latent = self.pool_sliding_window(latent, self.feat_len)
             logits, raw_value = self.get_logits_raw_value(latent)
             # dist = distributions.Categorical(logits=logits[:, :-1])
             dist = self.dist_fn(logits[:, :-1,:])

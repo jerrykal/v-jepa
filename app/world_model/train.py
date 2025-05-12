@@ -24,8 +24,8 @@ def imagine_data(world_model:JEPAWorldModel,agent: ActorCriticAgent,
     world_model.eval()
     agent.eval()
     # initial buffer
-    B, _, T, _, _ = sample_obs.shape
-    T = T//world_model.tubelet_size
+    B, C, T, H, W = sample_obs.shape
+    T = T//world_model.tubelet_size # image space len to latent space len
     latent_size = (imagine_batch_size, T + imagine_batch_length, world_model.get_num_patches(), world_model.embed_dim)
     action_size = (imagine_batch_size, T + imagine_batch_length, len(world_model.action_dims))
     scalar_size = (imagine_batch_size, T + imagine_batch_length)
@@ -40,24 +40,27 @@ def imagine_data(world_model:JEPAWorldModel,agent: ActorCriticAgent,
     embedding = rearrange(embedding, "B (T P) D -> B T P D",B=B, T=T,D=world_model.embed_dim)
     embedding_buffer[:, :T] = embedding
     action_buffer[:,:T] = sample_action[:, ::world_model.tubelet_size]
+    reward_hat_buffer[:,:T] = 0 # 0 -> T is dummy 
+    termination_hat_buffer[:,:T] = 0 # 0 -> T is dummy
 
     for i in range(imagine_batch_length):
         #repeat and save data
         # 1. Get current context embedding
-        current_embedding = rearrange(
+        predict_embedding = rearrange(
             embedding_buffer[:, i:i+T], "B T P D -> B (T P) D"
-        )  # e.g., [B, T*P, D]
+        )  
+        interactive_embedding = embedding_buffer[:, i+T-agent.feat_len:i+T]
 
         # 2. Actor use prediect latent sample action
         with torch.no_grad():
             # pred_embedding shape: [B, P, D] → flatten or pooled
-            action = agent.sample(current_embedding)  # ➜ [B, A]
+            action = agent.sample(interactive_embedding).unsqueeze(1)  # ➜ [B, 1, A]
             
         # 3. predict next frame embedding + reward/termination
         current_actions = torch.cat([action_buffer[:, i:i+clip_len], action],dim=1) # [B, T, A]
         with torch.no_grad():
             completed_embedding, pred_embedding, reward_hat, termination_hat = \
-                world_model.step(current_embedding, current_actions)
+                world_model.step(predict_embedding, current_actions)
             
         # 4. update buffer
         embedding_buffer[:, i+T:i+T+1] = pred_embedding.unsqueeze(1)        # [B, 1, P, D]
@@ -65,7 +68,7 @@ def imagine_data(world_model:JEPAWorldModel,agent: ActorCriticAgent,
         reward_hat_buffer[:, i+T:i+T+1] = reward_hat.unsqueeze(1)           # [B, 1]
         termination_hat_buffer[:, i+T:i+T+1] = termination_hat.unsqueeze(1) # [B, 1]
 
-    return  embedding_buffer[:,0:], \
+    return  embedding_buffer[:,T-agent.feat_len:], \
             action_buffer[:,T:], \
             reward_hat_buffer[:,T:], \
             termination_hat_buffer[:,T:]
@@ -140,7 +143,7 @@ def main(args, resume_preempt=False):
     env_name = env_setting.get("task")
     tensorboard_logger.init(log_save_path)
     num_envs = joint_train_agent.get("NumEnvs")
-    frame_skip = 1
+    frame_skip = args["Models"]["WorldModel"]["tubelet_size"]
     maxpooling = True
 
     # >>> dump config file and create log/ckpt dir 
@@ -157,7 +160,7 @@ def main(args, resume_preempt=False):
     replay_buffer = utils.build_replay_buffer(
         args, action_dims, 
         device=device if basic_setting.get("ReplayBufferOnGPU") else "cpu")
-    replay_buffer.load_buffer("/home/cgv/Documents/project/EmbodiedAgent/v-jepa/CombatSpider_sampe.npz")
+    # replay_buffer.load_buffer("/home/cgv/Documents/project/EmbodiedAgent/JEPA-STORM/Evaluation_smaple.npz")
 
     if joint_train_agent.get("UseDemonstration"):
         path = joint_train_agent.get("DemonstrationPath")
@@ -174,9 +177,6 @@ def main(args, resume_preempt=False):
     sum_reward = np.zeros(num_envs)
     current_obs, current_info = vec_env.reset()
 
-    # init context qeue
-    context_obs = deque(maxlen=16)
-    context_action = deque(maxlen=16)
 
     # trainin setting
     max_steps                           = joint_train_agent.get("SampleMaxSteps")
@@ -192,28 +192,37 @@ def main(args, resume_preempt=False):
     imagine_context_length              = joint_train_agent.get("ImagineContextLength")
     imagine_demonstration_batch_size    = joint_train_agent.get("ImagineDemonstrationBatchSize") if joint_train_agent.get("UseDemonstration") else 0
 
+    # init context qeue
+    context_obs = deque(maxlen=batch_length)
+    context_action = deque(maxlen=batch_length)
+
+    clip_len = imagine_context_length // world_model.tubelet_size
+    print("start training")
     # >>> Sample and Training 
     for total_steps in tqdm(range(max_steps//num_envs)):
         #  >>> sample part
-        if replay_buffer.ready():
+        if replay_buffer.ready() and len(context_obs) == batch_length:
             world_model.eval()
             agent.eval()
-            # with torch.no_grad():
-                # embedding = world_model.encode_obs(torch.from_numpy(context_obs)) # B,C,T,H,W -> B,(T P), D
-                # action = agent.sample(embedding, greedy=False) # ➜ [B, A]
-            action = vec_env.action_space.sample()
+            with torch.no_grad():
+                embedding = world_model.encode_obs(torch.cat(list(context_obs), dim=2).to(device=device)) # B,C,T,H,W -> B,(T P), D
+                embedding = rearrange(embedding, "B (T P) D -> B T P D",T=batch_length//world_model.tubelet_size)[:, -agent.feat_len:]
+                action = agent.sample(embedding, greedy=False) # ➜ [B, A]
+                action = np.squeeze(action.cpu())
+            # action = vec_env.action_space.sample()
         else:
             action = vec_env.action_space.sample()
             
         # current_obs shape convert to [a env, obs len, (obs)] the obs len will affect for maxpooling and frame skip
-        context_obs.append(rearrange(torch.Tensor(current_obs.copy()).cuda(), "C H W -> 1 1 C H W")/255) 
-        context_action.append(action)
-        obs, reward, done, truncated, info = vec_env.step(action)
-        replay_buffer.append(current_obs, action, reward, done)
+        last_obs, reward, done, truncated, info = vec_env.step(action)
+        for _obs in current_info["all_obs"]:
+            context_obs.append(rearrange(torch.from_numpy(_obs.copy()).float().cuda(), "C H W -> 1 C 1 H W") / 255)
+            context_action.append(action)
+            replay_buffer.append(_obs, action, reward, done)
 
         # update current status 
         sum_reward += reward
-        current_obs = obs
+        current_obs = last_obs
         current_info = info
 
         truncated = np.array([truncated])
@@ -251,7 +260,6 @@ def main(args, resume_preempt=False):
                 log_video = True
             else:
                 log_video = False
-            clip_len = imagine_context_length//world_model.tubelet_size
 
             imagine_latent, \
             agent_action, \

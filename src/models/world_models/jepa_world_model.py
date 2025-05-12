@@ -10,11 +10,11 @@ from einops import rearrange
 from typing import List, Tuple
 from src.masks.utils import apply_masks
 from src.models.utils.losses import SymLogTwoHotLoss
-from src.utils.tensors import repeat_interleave_batch
+from src.utils.tensors import repeat_interleave_batch, pool_sliding_window
 from src.models.attentive_pooler import AttentivePooler
 from src.models.vision_transformer import VisionTransformer as ViT
 from src.models.world_models.base_world_model import WorldModelBase
-from src.models.world_models.DecoderHead import RewardDecoder, TerminationDecoder
+from src.models.world_models.DecoderHead import RewardDecoder, TerminationDecoder, ActionDecoder
 from src.masks.multiblock3d import _MaskGenerator, WorldModelMaskGenerator, PrediectFrameMaskGenerator
 from src.models.utils.multimask import MultiMaskWrapper, WorldModelPredictorMultiMaskWrapper
 
@@ -69,7 +69,7 @@ def init_optimizer(
 
 class JEPAWorldModel(WorldModelBase):
     def __init__(self,
-                 action_dims:int,
+                 action_dims:list,
                  encoder_name:str="vit_small",
                  image_size:tuple=(224,224),
                  patch_size:int=16,
@@ -132,7 +132,7 @@ class JEPAWorldModel(WorldModelBase):
         if jepa_pretrain: self.load_jepa_dict(jepa_pretrain)
         
         #frist action token
-        self.empty_action = nn.Parameter(torch.zeros(1, 1, pred_embed_dim))
+        self.empty_action = nn.Parameter(torch.zeros(1, 1, pred_embed_dim), requires_grad=True)
         self.action_encoder = nn.Sequential(
             nn.Linear(sum(action_dims), pred_embed_dim),
             nn.ReLU()
@@ -140,6 +140,17 @@ class JEPAWorldModel(WorldModelBase):
 
         # Pooler
         self.attentive_pooler = AttentivePooler(
+            num_queries=1,
+            embed_dim=self.context_encoder.backbone.embed_dim,
+            num_heads=self.context_encoder.backbone.num_heads,
+            mlp_ratio=4.0,
+            depth=1,
+            norm_layer=nn.LayerNorm,
+            init_std=0.02,
+            qkv_bias=True,
+            complete_block=True,
+        )
+        self.inverse_attentive_pooler = AttentivePooler(
             num_queries=1,
             embed_dim=self.context_encoder.backbone.embed_dim,
             num_heads=self.context_encoder.backbone.num_heads,
@@ -161,6 +172,11 @@ class JEPAWorldModel(WorldModelBase):
             transformer_hidden_dim=self.context_encoder.backbone.embed_dim
         )
 
+        # Inverse Dynamic head
+        self.action_decoder = ActionDecoder(
+            transformer_hidden_dim=self.context_encoder.backbone.embed_dim,
+            action_dims=action_dims
+        )
         # Mask
         self.mask_generators:List[_MaskGenerator] = []
         for m in cfgs_mask:
@@ -199,7 +215,10 @@ class JEPAWorldModel(WorldModelBase):
         self.symlog_twohot_loss_func = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
 
         self.optimizer, self.scaler = init_optimizer(    
-            [self.context_encoder, self.predictor, self.attentive_pooler, self.reward_decoder, self.termination_decoder],
+            [self.context_encoder, 
+             self.predictor, 
+             self.attentive_pooler, self.inverse_attentive_pooler,
+             self.reward_decoder, self.termination_decoder, self.action_decoder],
             mixed_precision=False,
             betas=(0.9, 0.999),
             eps=1e-8,
@@ -232,7 +251,7 @@ class JEPAWorldModel(WorldModelBase):
         assert A_T == T+1 # Number of action == clip + prediect frame 
         last_z, completed_z=self.predictor.next_frame(embedding, _me, _mp, encoded_action)
         
-        feat = self.attentive_pooler(completed_z[0]).squeeze(1)
+        feat = self.attentive_pooler(last_z[0]).squeeze(1)
         reward_hat = self.reward_decoder(feat)
         reward_hat = self.symlog_twohot_loss_func.decode(reward_hat)
         
@@ -316,7 +335,7 @@ class JEPAWorldModel(WorldModelBase):
     
     def update(self, obs, actions, reward, termination, logger=None, log_video=False, **kwargs):
         self.train()
-        batch_size, batch_length = obs.shape[:2]
+        batch_size, _, batch_length = obs.shape[:3]
         visual_obs = obs.cpu().float().detach()
         self.target_encoder.eval()
         try:
@@ -362,14 +381,35 @@ class JEPAWorldModel(WorldModelBase):
             loss_reg += torch.mean(F.relu(1.-pstd_z))
             
             temporl_z = completed_z[-1] #Temporl mask predict
-            feat = self.attentive_pooler(temporl_z).squeeze(1)
+            temporl_z = rearrange(temporl_z, "B (T P) D -> B T P D", P=self.get_num_patches())
+            feat = pool_sliding_window(temporl_z, 1, self.attentive_pooler)
             reward_hat = self.reward_decoder(feat)
             termination_hat = self.termination_decoder(feat)
 
-            reward_loss = self.symlog_twohot_loss_func(reward_hat, reward[:,-1].squeeze())
-            termination_loss = self.bce_with_logits_loss_func(termination_hat, termination[:,-1].squeeze())
+            reward_loss = self.symlog_twohot_loss_func(reward_hat, reward[:, ::self.tubelet_size])
+            termination_loss = self.bce_with_logits_loss_func(termination_hat, termination[:, ::self.tubelet_size])
+            
+            feat = pool_sliding_window(temporl_z, 2, self.inverse_attentive_pooler)
+            actions_hat = self.action_decoder(feat)
 
-            loss = loss_jepa + self.reg_coeff * loss_reg + reward_loss + termination_loss
+            dim_start = 0
+            inverse_loss = 0 
+            for i, dim in enumerate(self.action_dims):
+                # logits
+                pred_logits = actions_hat[:, :, dim_start:dim_start+dim]    # shape [B, T, dim]
+                
+                # ground truth: one-hot to index
+                target_onehot = actions[:, :-1, dim_start:dim_start+dim]      # shape [B, T, dim]
+                target_index = target_onehot.argmax(dim=-1)                 # shape [B, T]
+
+                pred_logits = pred_logits.reshape(-1, dim)
+                target_index = target_index.reshape(-1)
+
+                # Cross entropy loss
+                inverse_loss += F.cross_entropy(pred_logits, target_index)
+                dim_start += dim
+            inverse_loss /= len(self.action_dims)
+            loss = loss_jepa + self.reg_coeff * loss_reg + reward_loss + termination_loss + inverse_loss
             # Step 2. Backward & step
             if self.mixed_precision:
                 self.scaler.scale(loss).backward()
@@ -387,7 +427,6 @@ class JEPAWorldModel(WorldModelBase):
                 self.scaler.update()
             else:
                 self.optimizer.step()
-            
             self.optimizer.zero_grad()
             # grad_stats = grad_logger(self.context_encoder.named_parameters())
             # grad_stats.global_norm = float(_enc_norm)
@@ -407,10 +446,11 @@ class JEPAWorldModel(WorldModelBase):
                 logger.log("WorldModel/loss_reg", loss_reg.item())
                 logger.log("WorldModel/reward_loss", reward_loss.item())
                 logger.log("WorldModel/termination_loss", termination_loss.item())
+                logger.log("WorldModel/inverse_loss",inverse_loss.item())
                 logger.log("WorldModel/total_loss", loss.item())
                 if log_video:
                     visual_obs = rearrange(visual_obs, "B C T H W ->B T C H W")
-                    logger.log("Recon/world_sample_video", torch.clamp(visual_obs[::batch_size//2], 0, 1).numpy())
+                    logger.log("Recon/world_sample_video", torch.clamp(visual_obs[::batch_size//16], 0, 1).numpy())
             
 def test_jepa_world_model():
     import numpy as np

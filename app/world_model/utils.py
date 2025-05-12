@@ -55,6 +55,7 @@ def build_agent(params, action_dim, device)->ActorCriticAgent:
     cfgs_model = params.get("Models").get("Agent")
     cfgs_env = params.get("Environment")
     return ActorCriticAgent(
+        feat_len=cfgs_model["InputLen"],
         feat_dim=sum(cfgs_model["InputFeature"]),
         num_layers=cfgs_model["NumLayers"],
         hidden_dim=cfgs_model["HiddenDim"],
