@@ -150,17 +150,17 @@ class JEPAWorldModel(WorldModelBase):
             qkv_bias=True,
             complete_block=True,
         )
-        # self.inverse_attentive_pooler = AttentivePooler(
-        #     num_queries=1,
-        #     embed_dim=self.context_encoder.backbone.embed_dim,
-        #     num_heads=self.context_encoder.backbone.num_heads,
-        #     mlp_ratio=4.0,
-        #     depth=1,
-        #     norm_layer=nn.LayerNorm,
-        #     init_std=0.02,
-        #     qkv_bias=True,
-        #     complete_block=True,
-        # )
+        self.inverse_attentive_pooler = AttentivePooler(
+            num_queries=1,
+            embed_dim=self.context_encoder.backbone.embed_dim,
+            num_heads=self.context_encoder.backbone.num_heads,
+            mlp_ratio=4.0,
+            depth=1,
+            norm_layer=nn.LayerNorm,
+            init_std=0.02,
+            qkv_bias=True,
+            complete_block=True,
+        )
         # Reward decoder head
         self.reward_decoder = RewardDecoder(
             num_classes=255,
@@ -174,7 +174,7 @@ class JEPAWorldModel(WorldModelBase):
 
         # Inverse Dynamic head
         self.action_decoder = ActionDecoder(
-            transformer_hidden_dim=self.context_encoder.backbone.embed_dim,
+            transformer_hidden_dim=self.context_encoder.backbone.embed_dim*2,
             action_dims=action_dims
         )
         # Mask
@@ -217,7 +217,7 @@ class JEPAWorldModel(WorldModelBase):
         self.optimizer, self.scaler = init_optimizer(    
             [self.context_encoder, 
              self.predictor, 
-             self.attentive_pooler, #self.inverse_attentive_pooler,
+             self.attentive_pooler, self.inverse_attentive_pooler,
              self.reward_decoder, self.termination_decoder, self.action_decoder],
             mixed_precision=False,
             betas=(0.9, 0.999),
@@ -392,36 +392,40 @@ class JEPAWorldModel(WorldModelBase):
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination[:, ::self.tubelet_size])
             
             # Inverse dynamic model
-            # feat = self.context_encoder(obs)
-            # feat = rearrange(feat, "B (T P) D -> B T P D", P=self.get_num_patches())
-            # feat = pool_sliding_window(feat, 2, self.attentive_pooler)
-            # actions_hat = self.action_decoder(feat)
+            feat = self.context_encoder(obs)
+            feat = rearrange(feat, "B (T P) D -> B T P D", P=self.get_num_patches())
+            feat = pool_sliding_window(feat, 1, self.inverse_attentive_pooler)
+            
+            feat_t     = feat[:, :-1]         # [B, T-1, D]
+            feat_tplus = feat[:, 1:]          # [B, T-1, D]
+            feat_pair  = torch.cat([feat_t, feat_tplus], dim=-1)  # [B, num_clips, 2D]
+            actions_hat = self.action_decoder(feat_pair)
 
-            # dim_start = 0
-            # inverse_loss = 0 
-            # for i, dim in enumerate(self.action_dims):
-            #     # logits
-            #     pred_logits = actions_hat[i]    # shape [B, T, dim]
+            dim_start = 0
+            inverse_loss = 0 
+            for i, dim in enumerate(self.action_dims):
+                # logits
+                pred_logits = actions_hat[i]    # shape [B, T, dim]
                 
-            #     # --- Add softmax & print ---
-            #     pred_probs = F.softmax(pred_logits, dim=-1)
-            #     print(f"Action dim {i} softmax probs (first batch, first time step):")
-            #     print(f"{pred_probs[0, 0]}: tatget: {(actions[0, 0, dim_start:dim_start+dim])}")
+                # --- Add softmax & print ---
+                # pred_probs = F.softmax(pred_logits, dim=-1)
+                # print(f"Action dim {i} softmax probs (first batch, first time step):")
+                # print(f"{pred_probs[0, 0]}: tatget: {(actions[0, 0, dim_start:dim_start+dim])}")
 
-            #     # ---------------------------
+                # ---------------------------
 
-            #     # ground truth: one-hot to index
-            #     target_onehot = actions[:, :-1, dim_start:dim_start+dim]      # shape [B, T, dim]
-            #     target_index = target_onehot.argmax(dim=-1)                 # shape [B, T]
+                # ground truth: one-hot to index
+                target_onehot = actions[:, :-1, dim_start:dim_start+dim]      # shape [B, T, dim]
+                target_index = target_onehot.argmax(dim=-1)                 # shape [B, T]
 
-            #     pred_logits = pred_logits.reshape(-1, dim)
-            #     target_index = target_index.reshape(-1)
-            #     # Cross entropy loss
-            #     inverse_loss += self.ce_loss(pred_logits, target_index)
-            #     dim_start += dim
-            # inverse_loss /= len(self.action_dims)
+                pred_logits = pred_logits.reshape(-1, dim)
+                target_index = target_index.reshape(-1)
+                # Cross entropy loss
+                inverse_loss += self.ce_loss(pred_logits, target_index)
+                dim_start += dim
+            inverse_loss /= len(self.action_dims)
 
-            loss = loss_jepa + self.reg_coeff * loss_reg + reward_loss + termination_loss #+ inverse_loss
+            loss = loss_jepa + self.reg_coeff * loss_reg + reward_loss + termination_loss + inverse_loss
             # Step 2. Backward & step
             if self.mixed_precision:
                 self.scaler.scale(loss).backward()
@@ -456,7 +460,7 @@ class JEPAWorldModel(WorldModelBase):
                 logger.log("WorldModel/loss_reg", loss_reg.item())
                 logger.log("WorldModel/reward_loss", reward_loss.item())
                 logger.log("WorldModel/termination_loss", termination_loss.item())
-                # logger.log("WorldModel/inverse_loss",inverse_loss.item())
+                logger.log("WorldModel/inverse_loss",inverse_loss.item())
                 logger.log("WorldModel/total_loss", loss.item())
                 if log_video:
                     visual_obs = rearrange(visual_obs, "B C T H W ->B T C H W")
