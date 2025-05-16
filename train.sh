@@ -1,7 +1,11 @@
+# MINEDOJO_HEADLESS=1 python -m app.main \
+#   --fname experiments/world_model/CollapseTest/100K-CombatSpider-BaseLine.yaml \
+#   --devices cuda:0
+
 MINEDOJO_HEADLESS=1 python -m app.main \
-  --fname experiments/world_model/100K-CombatSpider-Test.yaml \
+  --fname experiments/world_model/CollapseTest/100K-CombatSpider-InverseAndHybrid.yaml \
   --devices cuda:0
 
-# python -m app.main \
-#   --fname experiments/v-jepa/minedojo/vits16.yaml \
+# MINEDOJO_HEADLESS=1 python -m app.main \
+#   --fname experiments/world_model/CollapseTest/100K-CombatSpider-Inverse.yaml \
 #   --devices cuda:0

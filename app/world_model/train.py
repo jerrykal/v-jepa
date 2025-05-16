@@ -160,7 +160,7 @@ def main(args, resume_preempt=False):
     replay_buffer = utils.build_replay_buffer(
         args, action_dims, 
         device=device if basic_setting.get("ReplayBufferOnGPU") else "cpu")
-    # replay_buffer.load_buffer("/home/cgv/Documents/project/EmbodiedAgent/JEPA-STORM/Evaluation_smaple.npz")
+    # replay_buffer.load_buffer("/home/cgv/Documents/project/EmbodiedAgent/v-jepa/test_1024.npz")
 
     if joint_train_agent.get("UseDemonstration"):
         path = joint_train_agent.get("DemonstrationPath")

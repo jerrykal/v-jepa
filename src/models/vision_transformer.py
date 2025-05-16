@@ -245,6 +245,11 @@ class VisionTransformer(nn.Module):
             pos_embed = pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
             return pos_embed
 
+def vit_micro(patch_size=16, **kwargs):
+    model = VisionTransformer(
+        patch_size=patch_size, embed_dim=96, depth=8, num_heads=3, mlp_ratio=4,
+        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+    return model
 
 def vit_tiny(patch_size=16, **kwargs):
     model = VisionTransformer(
@@ -297,6 +302,7 @@ def vit_gigantic(patch_size=14, **kwargs):
 
 
 VIT_EMBED_DIMS = {
+    'vit_micro': 96,
     'vit_tiny': 192,
     'vit_small': 384,
     'vit_base': 768,

@@ -174,7 +174,7 @@ class VisionTransformerPredictor(nn.Module):
         x = alpha**0.5 * x + (1.-alpha)**0.5 * torch.randn(x.shape, device=x.device)
         return x
 
-    def next_frame(self, ctxt, masks_ctxt, masks_tgt, encode_action, mask_index=1):
+    def next_frame(self, ctxt, masks_ctxt, masks_tgt, encode_action, mask_index=-1):
         if not isinstance(masks_ctxt, list):
             masks_ctxt = [masks_ctxt]
 
@@ -328,7 +328,8 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_norm(x)
 
         # Completed feature
-        completed_x = self.predictor_proj(x)[:,:-T]
+        completed_x = x[:,:-T]
+        completed_x = self.predictor_proj(completed_x)
 
         # Return output corresponding to target tokens
         predict_x = x[:, N_ctxt:-T]

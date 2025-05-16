@@ -28,8 +28,8 @@ class ActionDecoder(IDecoderHead):
 
     def forward(self, feat):
         feat = self.backbone(feat)
-        actions = torch.cat([head(feat) for head in self.heads], dim=-1)
-        return actions
+        # actions = torch.cat([head(feat) for head in self.heads], dim=-1)
+        return [head(feat) for head in self.heads]
 
 class RewardDecoder(IDecoderHead):
     def __init__(self, transformer_hidden_dim, num_classes, depth=2):

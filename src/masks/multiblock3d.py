@@ -118,7 +118,7 @@ class _MaskGenerator(object):
         # -- Sample temporal block mask scale
         _rand = torch.rand(1, generator=generator).item()
         min_t, max_t = temporal_scale
-        temporal_mask_scale = min_t + _rand * (max_t - min_t)
+        temporal_mask_scale = min_t #+ _rand * (max_t - min_t)
         t = max(1, int(self.duration * temporal_mask_scale))
 
         # -- Sample spatial block mask scale
@@ -144,8 +144,7 @@ class _MaskGenerator(object):
         t, h, w = b_size
         top = torch.randint(0, self.height - h + 1, (1,))
         left = torch.randint(0, self.width - w + 1, (1,))
-        start = torch.randint(0, self.duration - t + 1, (1,))
-
+        start = self.duration - t #torch.randint(0, self.duration - t + 1, (1,))
         mask = torch.ones((self.duration, self.height, self.width), dtype=torch.int32)
         mask[start:start+t, top:top+h, left:left+w] = 0
 
