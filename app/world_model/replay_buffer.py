@@ -7,10 +7,11 @@ class ReplayBuffer():
     def __init__(self, 
                  obs_shape, action_dim, 
                  num_envs, 
-                 max_length=int(1E6), warmup_length=50000, 
+                 max_length=int(1E6), warmup_length=50000, frame_skip=4,
                  device="cpu") -> None:
         self.store_on_gpu = not device == "cpu"
         self.device = device
+        self.frame_skip = frame_skip
         #shape
         self._obs_shape = (max_length//num_envs, num_envs, *obs_shape)
         self._action_shape = (max_length//num_envs, num_envs, len(action_dim))
@@ -83,11 +84,14 @@ class ReplayBuffer():
 
     @torch.no_grad()
     def sample(self, batch_size, external_batch_size, batch_length, to_device="cuda"):
+        assert (batch_length % 4) == 0
         if self.store_on_gpu:
             obs, action, reward, termination = [], [], [], []
             if batch_size > 0:
                 for i in range(self.num_envs):
-                    indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs)
+                    valid_range = (self.length + 1 - batch_length) // self.frame_skip
+                    indexes = np.random.randint(0, valid_range, size=batch_size // self.num_envs) * self.frame_skip
+                    # indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs) 
                     obs.append(torch.stack([self.obs_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     action.append(torch.stack([self.action_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     reward.append(torch.stack([self.reward_buffer[idx:idx+batch_length, i] for idx in indexes]))
@@ -110,7 +114,9 @@ class ReplayBuffer():
             obs, action, reward, termination = [], [], [], []
             if batch_size > 0:
                 for i in range(self.num_envs):
-                    indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs)
+                    valid_range = (self.length + 1 - batch_length) // self.frame_skip
+                    indexes = np.random.randint(0, valid_range, size=batch_size // self.num_envs) * self.frame_skip
+                    # indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs) 
                     obs.append(np.stack([self.obs_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     action.append(np.stack([self.action_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     reward.append(np.stack([self.reward_buffer[idx:idx+batch_length, i] for idx in indexes]))

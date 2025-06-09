@@ -68,6 +68,7 @@ def build_agent(params, action_dim, device)->ActorCriticAgent:
 def build_replay_buffer(params, action_dims, device="cpu"):
     task_parameter = params.get("Environment").get("task_parameter")
     joint_train_agent = params.get("JointTrainAgent")
+    model_setting = params.get("Models")
 
     return ReplayBuffer(
         obs_shape=(task_parameter.get("image_size")[0], task_parameter.get("image_size")[1], 3),
@@ -75,6 +76,7 @@ def build_replay_buffer(params, action_dims, device="cpu"):
         num_envs=joint_train_agent.get("NumEnvs"),
         max_length=joint_train_agent.get("BufferMaxLength"),
         warmup_length=joint_train_agent.get("BufferWarmUp"),
+        frame_skip=model_setting["WorldModel"]["tubelet_size"],
         device=device,
     )
 

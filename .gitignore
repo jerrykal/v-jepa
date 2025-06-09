@@ -8,3 +8,4 @@ experiments/*
 *.pkl
 *.npz
 .vscode/*
+train.sh
