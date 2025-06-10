@@ -395,7 +395,7 @@ class JEPAWorldModel(WorldModelBase):
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination[:, ::self.tubelet_size])
             
             # Inverse dynamic model
-            inverse_loss = 0.0
+            inverse_loss = torch.tensor(0.0, device=obs.device)
             if self.use_inverse_dynamic:
                 feat = self.context_encoder(obs)
                 feat = rearrange(feat, "B (T P) D -> B T P D", P=self.get_num_patches())
