@@ -84,6 +84,7 @@ class JEPAWorldModel(WorldModelBase):
                  loss_exp=1.0,
                  reg_coeff=0.0,
                  ema:Tuple[float]=(0.998, 1.0),
+                 use_inverse_dynamic=False,
 
                  cfgs_mask:dict={},
                  jepa_pretrain:str=None,
@@ -99,6 +100,8 @@ class JEPAWorldModel(WorldModelBase):
         self.tubelet_size = tubelet_size
         self.img_size = image_size
         self.patch_size = patch_size
+        self.use_inverse_dynamic = use_inverse_dynamic
+
         # Context Encoder
         encoder:ViT = video_vit.__dict__[encoder_name](
             img_size=image_size[0],
@@ -392,38 +395,41 @@ class JEPAWorldModel(WorldModelBase):
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination[:, ::self.tubelet_size])
             
             # Inverse dynamic model
-            feat = self.context_encoder(obs)
-            feat = rearrange(feat, "B (T P) D -> B T P D", P=self.get_num_patches())
-            feat = pool_sliding_window(feat, 1, self.inverse_attentive_pooler)
-            
-            feat_t     = feat[:, :-1]         # [B, T-1, D]
-            feat_tplus = feat[:, 1:]          # [B, T-1, D]
-            feat_pair  = torch.cat([feat_t, feat_tplus], dim=-1)  # [B, num_clips, 2D]
-            actions_hat = self.action_decoder(feat_pair)
-
-            dim_start = 0
-            inverse_loss = 0 
-            for i, dim in enumerate(self.action_dims):
-                # logits
-                pred_logits = actions_hat[i]    # shape [B, T, dim]
+            inverse_loss = 0.0
+            if self.use_inverse_dynamic:
+                feat = self.context_encoder(obs)
+                feat = rearrange(feat, "B (T P) D -> B T P D", P=self.get_num_patches())
+                feat = pool_sliding_window(feat, 1, self.inverse_attentive_pooler)
                 
-                # --- Add softmax & print ---
-                # pred_probs = F.softmax(pred_logits, dim=-1)
-                # print(f"Action dim {i} softmax probs (first batch, first time step):")
-                # print(f"{pred_probs[0, 0]}: tatget: {(actions[0, 0, dim_start:dim_start+dim])}")
+                feat_t     = feat[:, :-1]         # [B, T-1, D]
+                feat_tplus = feat[:, 1:]          # [B, T-1, D]
+                feat_pair  = torch.cat([feat_t, feat_tplus], dim=-1)  # [B, num_clips, 2D]
+                actions_hat = self.action_decoder(feat_pair)
 
-                # ---------------------------
+    
+                dim_start = 0
+                inverse_loss = 0 
+                for i, dim in enumerate(self.action_dims):
+                    # logits
+                    pred_logits = actions_hat[i]    # shape [B, T, dim]
+                    
+                    # --- Add softmax & print ---
+                    # pred_probs = F.softmax(pred_logits, dim=-1)
+                    # print(f"Action dim {i} softmax probs (first batch, first time step):")
+                    # print(f"{pred_probs[0, 0]}: tatget: {(actions[0, 0, dim_start:dim_start+dim])}")
 
-                # ground truth: one-hot to index
-                target_onehot = actions[:, :-1, dim_start:dim_start+dim]      # shape [B, T, dim]
-                target_index = target_onehot.argmax(dim=-1)                 # shape [B, T]
+                    # ---------------------------
 
-                pred_logits = pred_logits.reshape(-1, dim)
-                target_index = target_index.reshape(-1)
-                # Cross entropy loss
-                inverse_loss += self.ce_loss(pred_logits, target_index)
-                dim_start += dim
-            inverse_loss /= len(self.action_dims)
+                    # ground truth: one-hot to index
+                    target_onehot = actions[:, :-1, dim_start:dim_start+dim]      # shape [B, T, dim]
+                    target_index = target_onehot.argmax(dim=-1)                 # shape [B, T]
+
+                    pred_logits = pred_logits.reshape(-1, dim)
+                    target_index = target_index.reshape(-1)
+                    # Cross entropy loss
+                    inverse_loss += self.ce_loss(pred_logits, target_index)
+                    dim_start += dim
+                inverse_loss /= len(self.action_dims)
 
             loss = loss_jepa + self.reg_coeff * loss_reg + reward_loss + termination_loss + inverse_loss
             # Step 2. Backward & step

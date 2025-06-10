@@ -1,13 +1,13 @@
 import torch
 import numpy as np
 import os
-import shutil
 import yaml
 
+from collections import deque
 from einops import rearrange
 from libs import env_wrapper
 from tqdm import tqdm
-from collections import deque
+
 from app.world_model import utils
 from app.world_model.replay_buffer import ReplayBuffer
 from src.models.agents.agents import ActorCriticAgent
@@ -123,6 +123,7 @@ def main(args, resume_preempt=False):
     # from app.world_model.unittest import main
     # main(args, resume_preempt)
     # return
+
     # >>> Set device
     if not torch.cuda.is_available():
         device = torch.device('cpu')
@@ -135,13 +136,14 @@ def main(args, resume_preempt=False):
     env_setting = args.get("Environment")
     logger_setting = args.get("logging")
     basic_setting = args.get("BasicSettings")
+    
     logger_path = logger_setting.get("folder")
-    log_save_path = os.path.join(mount_path_env, f"runs/{logger_path}")
-    dummy_config_path = os.path.join(mount_path_env, f"runs/{logger_path}/config.yaml")
-    ckpt_path = os.path.join(mount_path_env, f"ckpt/{logger_path}")
+    log_save_path       = os.path.join(mount_path_env, f"runs/{logger_path}")
+    dummy_config_path   = os.path.join(mount_path_env, f"runs/{logger_path}/config.yaml") 
+    ckpt_path           = os.path.join(mount_path_env, f"ckpt/{logger_path}")
+    tensorboard_logger.init(log_save_path)
 
     env_name = env_setting.get("task")
-    tensorboard_logger.init(log_save_path)
     num_envs = joint_train_agent.get("NumEnvs")
     frame_skip = args["Models"]["WorldModel"]["tubelet_size"]
     maxpooling = True
@@ -153,7 +155,7 @@ def main(args, resume_preempt=False):
         yaml.dump(args, f, default_flow_style=False)
 
     # >>> Create env 
-    vec_env = env_wrapper.build_single_env(args,frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
+    vec_env = env_wrapper.build_single_env(args, frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
     action_dims = list(vec_env.action_space.nvec)
 
     # >>> Build up replay buffer
@@ -172,7 +174,7 @@ def main(args, resume_preempt=False):
     world_model = utils.build_world_model(args, action_dims, device=device)
     agent = utils.build_agent(args, action_dims, device=device)
     
-    # initial variable
+    # Initial variable
     # reset envs and variables
     sum_reward = np.zeros(num_envs)
     current_obs, current_info = vec_env.reset()

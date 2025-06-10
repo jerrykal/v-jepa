@@ -43,6 +43,7 @@ def build_world_model(params, action_dims, device)->JEPAWorldModel:
         loss_exp=cfgs_model["loss_exp"],
         reg_coeff=cfgs_model["reg_coeff"],
         ema=cfgs_model["ema"],
+        use_inverse_dynamic=cfgs_model["inverse_dynamic"],
 
         cfgs_mask=cfgs_mask,
         jepa_pretrain=params.get("pretrain"),
@@ -148,7 +149,7 @@ def load_checkpoint(
     try:
         checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
     except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint {e}')
+        print(f'Encountered exception when loading checkpoint {e}')
 
     epoch = 0
     try:
@@ -157,19 +158,19 @@ def load_checkpoint(
         # -- loading encoder
         pretrained_dict = checkpoint['encoder']
         msg = encoder.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
+        print(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
 
         # -- loading predictor
         pretrained_dict = checkpoint['predictor']
         msg = predictor.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained predictor from epoch {epoch} with msg: {msg}')
+        print(f'loaded pretrained predictor from epoch {epoch} with msg: {msg}')
 
         # -- loading target_encoder
         if target_encoder is not None:
             print(list(checkpoint.keys()))
             pretrained_dict = checkpoint['target_encoder']
             msg = target_encoder.load_state_dict(pretrained_dict)
-            logger.info(
+            print(
                 f'loaded pretrained target encoder from epoch {epoch} with msg: {msg}'
             )
 
@@ -177,12 +178,12 @@ def load_checkpoint(
         opt.load_state_dict(checkpoint['opt'])
         if scaler is not None:
             scaler.load_state_dict(checkpoint['scaler'])
-        logger.info(f'loaded optimizers from epoch {epoch}')
-        logger.info(f'read-path: {r_path}')
+        print(f'loaded optimizers from epoch {epoch}')
+        print(f'read-path: {r_path}')
         del checkpoint
 
     except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint {e}')
+        print(f'Encountered exception when loading checkpoint {e}')
         epoch = 0
 
     return (
