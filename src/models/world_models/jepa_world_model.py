@@ -378,13 +378,14 @@ class JEPAWorldModel(WorldModelBase):
 
             # JEPA Reconstruction Loss
             loss_jepa, loss_reg = 0., 0.
-            h, _ = self._forward_target(obs, _masks_pred)
-            z, completed_z = self._forward_context(obs, h, _masks_enc, _masks_pred, encoded_action)
-            loss_jepa = self._recon_loss_func(z, h, _masks_pred)  # jepa prediction loss
-            pstd_z = self._reg_fn(z)  # predictor variance across patches
-            loss_reg += torch.mean(F.relu(1.-pstd_z))
+            h, _            = self._forward_target(obs, _masks_pred)
+            z, completed_z  = self._forward_context(obs, h, _masks_enc, _masks_pred, encoded_action)
+            loss_jepa       = self._recon_loss_func(z, h, _masks_pred)  # jepa prediction loss
+
+            pstd_z      = self._reg_fn(z)  # predictor variance across patches
+            loss_reg    += torch.mean(F.relu(1.-pstd_z))
             
-            temporl_z = completed_z[-1] #Temporl mask predict
+            temporl_z = completed_z[-1] # Temporl mask predict
             temporl_z = rearrange(temporl_z, "B (T P) D -> B T P D", P=self.get_num_patches())
             
             feat = pool_sliding_window(temporl_z, 1, self.attentive_pooler)

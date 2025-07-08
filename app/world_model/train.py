@@ -83,9 +83,8 @@ def train_world_model_step(
         log_video,
         **kwargs
     ):
-    if replay_buffer.ready():
-        obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length)
-        world_model.update(obs, action, reward, termination, logger=logger, log_video=log_video,**kwargs)
+    obs, action, reward, termination = replay_buffer.sample(batch_size, demonstration_batch_size, batch_length)
+    world_model.update(obs, action, reward, termination, logger=logger, log_video=log_video,**kwargs)
 
 def world_model_imagine_data(
         world_model:JEPAWorldModel,

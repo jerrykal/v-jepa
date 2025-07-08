@@ -130,8 +130,7 @@ class ReplayBuffer():
                 reward.append(external_reward)
                 termination.append(external_termination)
 
-            obs = torch.from_numpy(np.concatenate(obs, axis=0)).float().cuda() / 255
-            obs = rearrange(obs, "B T H W C -> B C T H W")
+            obs = rearrange(torch.from_numpy(np.concatenate(obs, axis=0)).float().cuda() / 255, "B T H W C -> B C T H W")
             action = torch.from_numpy(np.concatenate(action, axis=0)).cuda()
             reward = torch.from_numpy(np.concatenate(reward, axis=0)).cuda()
             termination = torch.from_numpy(np.concatenate(termination, axis=0)).cuda()
