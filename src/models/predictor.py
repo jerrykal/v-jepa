@@ -258,7 +258,8 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_norm(x)
 
         # Return output corresponding to target tokens
-        x = x[:, N_ctxt:]
+        N_input = N_ctxt if self.action_adapter_type == "None" else N_ctxt+1
+        x = x[:, N_input:]
         x = self.predictor_proj(x)
 
         return x

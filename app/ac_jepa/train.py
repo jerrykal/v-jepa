@@ -480,7 +480,6 @@ def main(args, resume_preempt=False):
                     x = [rearrange(_h, "B (t p) D -> B t p D", t=num_frames//tubelet_size, p=(crop_size//patch_size)**2) for _h in h]
                     results = latent_action_enc(x)
                     act_list, loss_list = zip(*results)  
-                    print(act_list[0].shape)
                     return list(act_list), torch.stack(loss_list).mean()
                 
                 def forward_context(c, h, act):
@@ -581,7 +580,7 @@ def main(args, resume_preempt=False):
                     iter_elapsed_time_ms)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
-                        '[%d, %5d] loss: %.3f | p%.3f r%.3f | '
+                        '[%d, %5d] loss: %.3f | p%.3f q%.3f r%.3f | '
                         'input_var: %.3f %.3f | '
                         'masks: %s '
                         '[wd: %.2e] [lr: %.2e] '
