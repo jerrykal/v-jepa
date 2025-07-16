@@ -13,6 +13,7 @@ def get_3d_sincos_pos_embed(
     grid_size,
     grid_depth,
     cls_token=False,
+    action_token=False,
     uniform_power=False
 ):
     """
@@ -41,10 +42,12 @@ def get_3d_sincos_pos_embed(
     pos_embed = pos_embed[:, :embed_dim]
     if cls_token:
         pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    if action_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, action_token=False):
     """
     grid_size: int of the grid height and width
     returns:
@@ -59,6 +62,8 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_w)  # (H*W, D/2)
     pos_embed = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
+    if action_token:
         pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
     return pos_embed
 

@@ -8,8 +8,99 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import einsum, rearrange, repeat
+from typing import Literal
+from torch import Tensor
+from math import pi
 
+class RotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim : int,
+        kind: Literal['1d', '2d', 'const'] = '1d',
+        theta = 10000,
+        max_freq = 10,
+        num_freq = 1,
+        learned_freq = False,
+        interpolate_factor = 1.,
+        theta_rescale_factor = 1.,
+    ) -> None:
+        super().__init__()
+        
+        theta *= theta_rescale_factor ** (dim / (dim - 2))
 
+        match kind:
+            case '1d':
+                freq = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+            case '2d':
+                freq = torch.linspace(1., max_freq / 2, dim // 2) * pi
+            case 'const':
+                freq = torch.ones(num_freq).float()
+                
+        self.freq = nn.Parameter(freq, requires_grad=learned_freq)
+        
+        assert interpolate_factor >= 1.
+        self.interpolate_factor = interpolate_factor
+        
+        self.default_seq_dim = -2
+        
+    def forward(
+        self,
+        seq : Tensor,
+        seq_dim : int | None = None,
+        offset = 0,
+    ) -> Tensor:
+        seq_dim = seq_dim if not seq_dim == None else self.default_seq_dim 
+        seq_len = seq.shape[seq_dim]
+        
+        freq = self.freq
+        
+        # Get sequence position
+        pos = (torch.arange(seq_len, device=freq.device) + offset) / self.interpolate_factor
+        
+        freq = einsum(pos, freq, '..., f -> ... f')
+        freq = repeat(freq, '... n -> ... (n r)', r = 2)
+        
+        if seq_dim == -3: freq = rearrange(freq, 'n d -> n 1 d')
+        
+        # Apply rotary embedding
+        return self.apply(freq, seq, seq_dim = seq_dim)
+        
+    def apply(
+        self,
+        freq : Tensor,
+        seq  : Tensor,
+        start_index : int = 0,
+        scale : float = 1.,
+        seq_dim : int = -2
+    ) -> Tensor:
+        dtype = seq.dtype
+
+        if seq.ndim == 3:
+            seq_len = seq.shape[seq_dim]
+            freq = freq[-seq_len:]
+
+        rot_dim = freq.shape[-1]
+        end_index = start_index + rot_dim
+
+        assert rot_dim <= seq.shape[-1], f'feature dimension {seq.shape[-1]} is not of sufficient size to rotate in all the positions {rot_dim}'
+
+        t_left, seq, t_right = seq[..., :start_index], seq[..., start_index:end_index], seq[..., end_index:]
+        
+        seq = (seq * freq.cos() * scale) + (self.rotate_half(seq) * freq.sin() * scale)
+        out = torch.cat((t_left, seq, t_right), dim = -1)
+        
+        return out.type(dtype)
+    
+    def rotate_half(self, inp : Tensor) -> Tensor:
+        inp = rearrange(inp, '... (d r) -> ... d r', r = 2)
+        x1, x2 = inp.unbind(dim = -1)
+        inp = torch.stack((-x2, x1), dim = -1)
+        return rearrange(inp, '... d r -> ... (d r)')
+    
+    def get_seq_pos(self, seq_len, device, dtype, offset = 0):
+        return (torch.arange(seq_len, device = device, dtype = dtype) + offset) / self.interpolate_factor
+    
 class MLP(nn.Module):
     def __init__(
         self,
@@ -179,3 +270,68 @@ class CrossAttentionBlock(nn.Module):
         q = q + y
         q = q + self.mlp(self.norm2(q))
         return q
+
+class SpatialAttention(nn.Module):
+    def __init__(self, 
+                dims,
+                num_heads,
+                qkv_bias=False,
+                qk_scale=None,
+                drop=0.,
+                attn_drop=0.):
+        super().__init__()
+        self.embed = RotaryEmbedding(dims, kind='1d')
+
+        self.attn = Attention(
+            dim=dims,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop
+            )
+        
+    def forward(
+        self,
+        x : Tensor,
+    ) -> Tensor:
+        B, T, P, D = x.shape
+        x = x.view(B * T, P, D)                # [B*T, P, D]
+        x = self.embed(x, seq_dim=1)           # rotary along patch dim
+        x, _ = self.attn(x)                    # attention on spatial patches
+        x = x.view(B, T, P, D)                 # [B, T, P, D]
+        return x
+    
+class TemporalAttention(nn.Module):
+    def __init__(self, 
+                dims,
+                num_heads,
+                qkv_bias=False,
+                qk_scale=None,
+                drop=0.,
+                attn_drop=0.):
+        super().__init__()
+        self.embed = RotaryEmbedding(dims, kind='1d')
+
+        self.attn = Attention(
+            dim=dims,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, P, D]
+        B, T, P, D = x.shape
+        # Reshape to [B * P, T, D] to group all patches along time
+        x = x.permute(0, 2, 1, 3).contiguous()  # [B, P, T, D]
+        x = x.view(B * P, T, D)                 # [B*P, T, D]
+        # Apply rotary embedding along time dimension
+        x = self.embed(x, seq_dim=1)
+        # Apply attention
+        x, _ = self.attn(x)                     # [B*P, T, D]
+        # Reshape back to [B, T, P, D]
+        x = x.view(B, P, T, D).permute(0, 2, 1, 3).contiguous()  # [B, T, P, D]
+        return x

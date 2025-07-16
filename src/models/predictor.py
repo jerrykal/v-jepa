@@ -19,7 +19,22 @@ from src.utils.tensors import (
 )
 from src.masks.utils import apply_masks
 
+class ActionAdapter(nn.Module):
+    def __init__(self):
+        super().__init__()
 
+    def forward(self, x, action):
+        return x
+
+class ConcatAdapter(ActionAdapter):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, action):
+        B, N, D = x.shape
+        action_exp = action.unsqueeze(1).expand(-1, 1, -1)     # [B, 1, D]
+        return torch.cat([x, action_exp], dim=1)               # [B, N+1, D]
+    
 class VisionTransformerPredictor(nn.Module):
     """ Vision Transformer """
     def __init__(
@@ -48,6 +63,14 @@ class VisionTransformerPredictor(nn.Module):
         super().__init__()
         # Map input to predictor dimension
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+
+        # Action input adapter
+        self.action_adapter_type = kwargs.get("adapter_type", "None")
+        if self.action_adapter_type != "None":
+            self.action_dim = kwargs.get("action_dim")
+            self.action_adapter = ConcatAdapter()
+        else:
+            self.action_adapter = ActionAdapter()
 
         # Mask tokens
         self.mask_tokens = None
@@ -81,6 +104,7 @@ class VisionTransformerPredictor(nn.Module):
                 (img_size // patch_size)
                 * (img_size // patch_size)
             )
+ 
         # Position embedding
         self.uniform_power = uniform_power
         self.predictor_pos_embed = None
@@ -127,11 +151,10 @@ class VisionTransformerPredictor(nn.Module):
                 embed_dim,
                 grid_size,
                 grid_depth,
-                cls_token=False,
                 uniform_power=self.uniform_power
             )
         else:
-            sincos = get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False)
+            sincos = get_2d_sincos_pos_embed(embed_dim, grid_size)
         pos_embed.copy_(torch.from_numpy(sincos).float().unsqueeze(0))
 
     def _init_weights(self, m):
@@ -171,7 +194,7 @@ class VisionTransformerPredictor(nn.Module):
         x = alpha**0.5 * x + (1.-alpha)**0.5 * torch.randn(x.shape, device=x.device)
         return x
 
-    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, mask_index=1):
+    def forward(self, ctxt, tgt, masks_ctxt, masks_tgt, act=None, mask_index=1):
         """
         :param ctxt: context tokens
         :param tgt: target tokens
@@ -192,13 +215,15 @@ class VisionTransformerPredictor(nn.Module):
 
         # Map context tokens to pedictor dimensions
         x = self.predictor_embed(ctxt)
+        act = self.predictor_embed(act)
+        
         _, N_ctxt, D = x.shape
-
         # Add positional embedding to ctxt tokens
         if self.predictor_pos_embed is not None:
             ctxt_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
             x += apply_masks(ctxt_pos_embed, masks_ctxt)
 
+        x = self.action_adapter(x, act)
         # Map target tokens to predictor dimensions & add noise (fwd diffusion)
         if self.mask_tokens is None:
             pred_tokens = self.predictor_embed(tgt)
@@ -237,8 +262,7 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_proj(x)
 
         return x
-
-
+    
 def vit_predictor(**kwargs):
     model = VisionTransformerPredictor(
         mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),

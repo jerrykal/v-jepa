@@ -29,7 +29,7 @@ parser.add_argument(
     default=None)
 parser.add_argument(
     '--batch-launch', action='store_true',
-    help='whether fname points to a file to batch-lauch several config files')
+    help='whether fname points to a file to abatch-lauch several config files')
 parser.add_argument(
     '--fname', type=str,
     help='yaml file containing config file names to launch',
