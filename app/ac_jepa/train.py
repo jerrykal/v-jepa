@@ -213,6 +213,7 @@ def main(args, resume_preempt=False):
         ('%.5f', 'reg-loss'),
         ('%.5f', 'enc-grad-norm'),
         ('%.5f', 'pred-grad-norm'),
+        ('%.5f', 'la-grad-norm'),
         ('%d', 'gpu-time(ms)'),
         ('%d', 'wall-time(ms)'),
     )
@@ -345,7 +346,7 @@ def main(args, resume_preempt=False):
     start_epoch = 0
     # -- load training checkpoint
     if pre_train_model:
-        encoder, target_encoder = load_jepa_encoder(pre_train_model, encoder, target_encoder)
+        encoder, target_encoder, predictor = load_jepa_encoder(pre_train_model, encoder, target_encoder, predictor)
 
     if load_model or os.path.exists(latest_path):
         (
@@ -514,7 +515,7 @@ def main(args, resume_preempt=False):
                 loss = loss_jepa + reg_coeff * loss_reg + loss_quant * quant_coeff
 
                 # Step 2. Backward & step
-                _enc_norm, _pred_norm = 0., 0.
+                _enc_norm, _pred_norm, _la_norm = 0., 0., 0.
                 if mixed_precision:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -523,6 +524,7 @@ def main(args, resume_preempt=False):
                 if (epoch > warmup) and (clip_grad is not None):
                     _enc_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
                     _pred_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
+                    _la_norm = torch.nn.utils.clip_grad_norm_(latent_action_enc.parameters(), clip_grad)
                 if mixed_precision:
                     scaler.step(optimizer)
                     scaler.update()
@@ -532,6 +534,8 @@ def main(args, resume_preempt=False):
                 grad_stats.global_norm = float(_enc_norm)
                 grad_stats_pred = grad_logger(predictor.named_parameters())
                 grad_stats_pred.global_norm = float(_pred_norm)
+                grad_stats_la_enc = grad_logger(predictor.named_parameters())
+                grad_stats_la_enc.global_norm = float(_la_norm)
                 optimizer.zero_grad()
                 optim_stats = adamw_logger(optimizer)
 
@@ -550,9 +554,10 @@ def main(args, resume_preempt=False):
                     _new_wd,
                     grad_stats,
                     grad_stats_pred,
+                    grad_stats_la_enc,
                     optim_stats,
                 )
-            (loss, loss_jepa, loss_quant, loss_reg, _new_lr, _new_wd, grad_stats, grad_stats_pred, optim_stats,), gpu_etime_ms = gpu_timer(train_step)
+            (loss, loss_jepa, loss_quant, loss_reg, _new_lr, _new_wd, grad_stats, grad_stats_pred, grad_stats_la_enc, optim_stats,), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.
             loss_meter.update(loss)
             input_var = float(AllReduce.apply(clips.view(clips.shape[0], -1).var(dim=1).mean(dim=0)))
@@ -576,11 +581,12 @@ def main(args, resume_preempt=False):
                     loss_reg,
                     grad_stats.global_norm,
                     grad_stats_pred.global_norm,
+                    grad_stats_la_enc.global_norm,
                     gpu_etime_ms,
                     iter_elapsed_time_ms)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
-                        '[%d, %5d] loss: %.3f | p%.3f q%.3f r%.3f | '
+                        '[%d, %5d] loss: %.3f | p:%.3f q:%.3f r:%.3f | '
                         'input_var: %.3f %.3f | '
                         'masks: %s '
                         '[wd: %.2e] [lr: %.2e] '
@@ -631,6 +637,16 @@ def main(args, resume_preempt=False):
                                grad_stats_pred.min,
                                grad_stats_pred.max,
                                grad_stats_pred.global_norm))
+                               
+                    if grad_stats_la_enc is not None:
+                        logger.info(
+                            '[%d, %5d] la_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
+                            % (epoch + 1, itr,
+                               grad_stats_la_enc.first_layer,
+                               grad_stats_la_enc.last_layer,
+                               grad_stats_la_enc.min,
+                               grad_stats_la_enc.max,
+                               grad_stats_la_enc.global_norm))
             log_stats()
             assert not np.isnan(loss), 'loss is nan'
 

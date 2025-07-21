@@ -28,7 +28,8 @@ logger = logging.getLogger()
 def load_jepa_encoder(
     model_path,
     encoder,
-    target_encoder
+    target_encoder,
+    predictor
 ):
     try:
         checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
@@ -53,10 +54,18 @@ def load_jepa_encoder(
         else:
             logger.warning('No "target_encoder" found in checkpoint.')
 
+        # -- loading predictor
+        if predictor is not None and 'predictor' in checkpoint:
+            pretrained_dict = checkpoint['predictor']
+            msg = predictor.load_state_dict(pretrained_dict, strict=False)
+            logger.info(f'Loaded JEPA predictor with msg: {msg}')
+        else:
+            logger.warning('No "predictor" found in checkpoint.')
+
     except Exception as e:
         logger.info(f'Failed to load JEPA encoder/target_encoder: {e}')
 
-    return encoder, target_encoder
+    return encoder, target_encoder, predictor
 
 def load_checkpoint(
     r_path,
