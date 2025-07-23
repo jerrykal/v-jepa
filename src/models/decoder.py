@@ -29,14 +29,14 @@ def compute_scale_schedule(start, target, num_layers, prefer=2):
 class VideoDecoder(nn.Module):
     def __init__(self,
                  embed_dim=768,
-                 out_dim=3,
+                 stem_dim=128,
                  num_layers=4,
+                 out_dim=3,
                  patch_size=16,
                  tubelet_size=2,
                  img_size=224,
                  num_frames=16,
-                 use_tanh=True,
-                 prefer_scale=2):
+                 use_tanh=True):
         
         super().__init__()
         self.patch_size = patch_size
@@ -44,62 +44,60 @@ class VideoDecoder(nn.Module):
         self.img_size = img_size
         self.num_frames = num_frames
         self.embed_dim = embed_dim
-        self.out_dim = out_dim
+        self.stem_dim = stem_dim
         self.num_layers = num_layers
+        self.out_dim = out_dim
 
+        # Input token info
+        self.h0 = self.w0 = img_size // patch_size
         self.t0 = num_frames // tubelet_size
-        self.h0 = img_size // patch_size
-        self.w0 = img_size // patch_size
         self.n_patch = self.h0 * self.w0
         self.total_tokens = self.t0 * self.n_patch
 
-        self.temp_scales = compute_scale_schedule(self.t0, num_frames, num_layers, prefer=prefer_scale)
-        self.spat_scales = compute_scale_schedule(self.h0, img_size, num_layers, prefer=prefer_scale)
 
-        assert len(self.temp_scales) == num_layers
-        assert len(self.spat_scales) == num_layers
+        # Step 1: channel schedule
+        start_ch = stem_dim * num_layers
+        ch_schedule = [embed_dim, start_ch]
+        step = (start_ch - stem_dim) // (num_layers - 1) if num_layers > 1 else 0
+        for i in range(1, num_layers):
+            ch_schedule.append(start_ch - i * step)
+        ch_schedule.append(stem_dim)  # ensure last
+        ch_schedule = ch_schedule[:num_layers + 1]  # total num_layers steps
 
-        in_ch = embed_dim
-        self.layers = nn.ModuleList()
-        for i in range(num_layers):
-            out_ch = in_ch // 2 if i < num_layers - 1 else in_ch  
-            conv = nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1)
-            bn = nn.BatchNorm3d(out_ch)
-            act = nn.ReLU(inplace=True)
-            self.layers.append(nn.Sequential(conv, bn, act))
-            in_ch = out_ch
+        # Step 2: build decoder blocks
+        self.decoder_blocks = nn.ModuleList()
+        for in_ch, out_ch in zip(ch_schedule[:-1], ch_schedule[1:]):
+            block = nn.Sequential(
+                nn.Upsample(scale_factor=(2, 2, 2), mode='trilinear', align_corners=False),
+                nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1),
+                nn.BatchNorm3d(out_ch),
+                nn.ReLU(inplace=True)
+            )
+            self.decoder_blocks.append(block)
 
-        self.head = nn.Conv3d(in_ch, out_dim, kernel_size=1)
-        self.act_out = nn.Tanh() if use_tanh else nn.Identity()
+        # Step 3: final to RGB + optional tanh
+        self.head = nn.Conv3d(stem_dim, out_dim, kernel_size=1)
+        self.act = nn.Tanh() if use_tanh else nn.Identity()
 
-    def forward(self, x):
-        """
-        x: [B, T*N, C] where T = num_frames//tubelet_size, N = (H*W)/patch_size^2
-        """
+    def forward(self, x):  # x: [B, t*N, C]
         B, TN, C = x.shape
-        assert TN == self.total_tokens, f"Expected {self.total_tokens}, got {TN}."
+        assert TN == self.total_tokens, f"Expected {self.total_tokens}, got {TN}"
 
-        # [B, T'*H'*W', C] → [B, T', H', W', C]
+        # → [B, t, H, W, C] → [B, C, t, H, W]
         x = x.view(B, self.t0, self.h0, self.w0, C)
-        x = x.permute(0, 4, 1, 2, 3).contiguous()  # [B, C, T', H', W']
+        x = x.permute(0, 4, 1, 2, 3).contiguous()  # [B, C, t, h, w]
 
-        t, h, w = self.t0, self.h0, self.w0
-
-        for i, layer in enumerate(self.layers):
-            if i == len(self.layers) - 1:
-                tgt_t, tgt_h, tgt_w = self.num_frames, self.img_size, self.img_size
-                x = F.interpolate(x, size=(tgt_t, tgt_h, tgt_w), mode='trilinear', align_corners=False)
-            else:
-                sT = self.temp_scales[i]
-                sS = self.spat_scales[i]
-                tgt_t = int(round(t * sT))
-                tgt_h = int(round(h * sS))
-                tgt_w = int(round(w * sS))
-                x = F.interpolate(x, size=(tgt_t, tgt_h, tgt_w), mode='trilinear', align_corners=False)
-                t, h, w = tgt_t, tgt_h, tgt_w
-
-            x = layer(x)
+        for block in self.decoder_blocks:
+            x = block(x)
+        B, C, T, H, W = x.shape
+        if self.num_frames != T and \
+            self.img_size != H and self.img_size != W:
+            x = F.interpolate(
+                x, 
+                size=(self.num_frames, self.img_size, self.img_size), 
+                mode='trilinear',
+                align_corners=False
+            )
 
         x = self.head(x)
-        x = self.act_out(x)
-        return x
+        return self.act(x)
