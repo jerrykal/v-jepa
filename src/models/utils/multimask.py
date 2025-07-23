@@ -60,3 +60,4 @@ class LatentActionEncoderMultiMaskWrapper(nn.Module):
         for _x in x:
             outs += [self.backbone(_x)]
         return outs
+
