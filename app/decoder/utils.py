@@ -97,6 +97,7 @@ def init_video_model(
     model_name='vit_base',
     crop_size=224,
     decoder_layers=4,
+    decoder_stem_dim=64,
     uniform_power=False,
     use_sdpa=False,
 ):
@@ -112,6 +113,7 @@ def init_video_model(
     
     decoder = VideoDecoder(
         embed_dim=encoder.embed_dim,
+        stem_dim=decoder_stem_dim,
         out_dim=3,
         num_layers=decoder_layers,
         patch_size=patch_size,

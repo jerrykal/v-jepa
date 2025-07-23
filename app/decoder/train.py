@@ -99,6 +99,7 @@ def main(args, resume_preempt=False):
     uniform_power = cfgs_model.get('uniform_power', True)
     training_model_list = cfgs_model.get('training_model_list', ["encoder", "decoder"])
     decoder_layers = cfgs_model.get('decoder_layers', 4)
+    decoder_stem_dim = cfgs_model.get('decoder_stem_dim', 64)
 
     # -- DATA
     cfgs_data = args.get('data')
@@ -213,7 +214,8 @@ def main(args, resume_preempt=False):
         model_name=model_name,
         crop_size=crop_size,
         use_sdpa=use_sdpa,
-        decoder_layers=decoder_layers
+        decoder_layers=decoder_layers,
+        decoder_stem_dim=decoder_stem_dim
     )
 
     all_named_modules = {

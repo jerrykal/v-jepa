@@ -29,7 +29,7 @@ def compute_scale_schedule(start, target, num_layers, prefer=2):
 class VideoDecoder(nn.Module):
     def __init__(self,
                  embed_dim=768,
-                 stem_dim=128,
+                 stem_dim=64,
                  num_layers=4,
                  out_dim=3,
                  patch_size=16,
