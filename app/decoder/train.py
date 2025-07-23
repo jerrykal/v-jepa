@@ -20,6 +20,7 @@ except Exception:
 import copy
 import time
 import numpy as np
+from PIL import Image
 
 import torch
 import torch.multiprocessing as mp
@@ -63,6 +64,33 @@ torch.backends.cudnn.benchmark = True
 
 logger = get_logger(__name__)
 
+def save_tensor_to_gif(video: torch.Tensor, save_path:str, epoch:int, filename:str,fps=10):
+    """
+    tensor: torch.Tensor, shape [3, T, H, W], value in [-1, 1]
+    filename: output gif path
+    fps: frames per second
+    """
+    assert video.ndim == 4 and video.shape[0] == 3, "Expected shape [3, T, H, W]"
+
+    # [-1, 1] → [0, 255]
+    video = ((video + 1) / 2 * 255).clamp(0, 255).byte()  # torch.uint8
+
+    # [3, T, H, W] → [T, H, W, 3]
+    video = video.permute(1, 2, 3, 0).cpu().numpy()  # numpy [T, H, W, 3]
+
+    frames = [Image.fromarray(frame) for frame in video]
+
+    duration = int(1000 / fps)
+    file_path = os.path.join(save_path, f"{epoch}_{filename}.gif")
+
+    frames[0].save(
+        file_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration,
+        loop=0
+    )
+    logger.info(f"GIF saved to {file_path}")
 
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
@@ -190,7 +218,9 @@ def main(args, resume_preempt=False):
         if not os.path.exists(load_path):
             load_path = None
             load_model = False
-
+    recon_folder = os.path.join(folder, f'recon')
+    os.makedirs(recon_folder, exist_ok=True)
+    
     # -- make csv_logger
     csv_logger = CSVLogger(
         log_file,
@@ -312,19 +342,13 @@ def main(args, resume_preempt=False):
 
     if load_model or os.path.exists(latest_path):
         (
-            encoder,
-            predictor,
-            target_encoder,
-            latent_action_enc,
+            decoder,
             optimizer,
             scaler,
             start_epoch,
         ) = load_checkpoint(
             r_path=load_path,
-            encoder=encoder,
-            predictor=predictor,
-            target_encoder=target_encoder,
-            latent_action_enc=latent_action_enc,
+            decoder=decoder,
             opt=optimizer,
             scaler=scaler)
         for _ in range(start_epoch * ipe):
@@ -440,12 +464,8 @@ def main(args, resume_preempt=False):
                         preds = [preds]
                         targets = [targets]
 
-                   
                     loss = 0.
                     for p, t in zip(preds, targets):
-                        print(p.shape)
-                        print(t.shape)
-
                         if loss_type == 'l1':
                             loss += torch.mean(torch.abs(p - t))
                         elif loss_type == 'l2':
@@ -468,7 +488,7 @@ def main(args, resume_preempt=False):
                 loss = loss_recon
 
                 # Step 2. Backward & step
-                _enc_norm, _pred_norm = 0., 0.
+                _enc_norm, _dec_norm = 0., 0.
                 if mixed_precision:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -488,6 +508,14 @@ def main(args, resume_preempt=False):
                 grad_stats_dec.global_norm = float(_dec_norm)
                 optimizer.zero_grad()
                 optim_stats = adamw_logger(optimizer)
+
+                # if (epoch % 10 == 0 and epoch != 0) and itr == 0:
+                if epoch % 10 == 0 and itr == 0: 
+                    batch_size = clips.shape[0]
+                    index = torch.randint(0, batch_size, (1,)).item()
+                    save_tensor_to_gif(clips[index], recon_folder, epoch=epoch, filename="original")
+                    save_tensor_to_gif(hat_clips[index], recon_folder, epoch=epoch, filename="reconstrued")
+
 
                 return (
                     float(loss),
@@ -565,7 +593,7 @@ def main(args, resume_preempt=False):
 
                     if grad_stats_dec is not None:
                         logger.info(
-                            '[%d, %5d] pred_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
+                            '[%d, %5d] dec_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
                             % (epoch + 1, itr,
                                grad_stats_dec.first_layer,
                                grad_stats_dec.last_layer,
