@@ -110,15 +110,14 @@ def init_video_model(
         use_sdpa=use_sdpa,
     )
 
-    
     decoder = VideoDecoder(
         embed_dim=encoder.embed_dim,
         stem_dim=decoder_stem_dim,
-        out_dim=3,
         num_layers=decoder_layers,
         patch_size=patch_size,
         tubelet_size=tubelet_size,
-        img_size=crop_size,
+        height=crop_size,
+        width=crop_size,
         num_frames=num_frames,
     )
     encoder = MultiMaskWrapper(encoder)
