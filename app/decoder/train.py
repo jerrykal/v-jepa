@@ -509,8 +509,7 @@ def main(args, resume_preempt=False):
                 optimizer.zero_grad()
                 optim_stats = adamw_logger(optimizer)
 
-                # if (epoch % 10 == 0 and epoch != 0) and itr == 0:
-                if epoch % 10 == 0 and itr == 0: 
+                if (epoch % 10 == 0 and epoch != 0) and itr == 0:
                     batch_size = clips.shape[0]
                     index = torch.randint(0, batch_size, (1,)).item()
                     save_tensor_to_gif(clips[index], recon_folder, epoch=epoch, filename="original")

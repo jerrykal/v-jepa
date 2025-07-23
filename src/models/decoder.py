@@ -40,12 +40,13 @@ class VideoDecoder(nn.Module):
         h_upsample = int(math.log2(self.h_scale))
         w_upsample = int(math.log2(self.w_scale))
         self.upsample_steps = max(t_upsample, h_upsample, w_upsample)
-
+        step = num_layers
         # build decoder blocks
         layers = []
-        in_dim = stem_dim * num_layers
+        in_dim = stem_dim * step
         for i in range(self.upsample_steps):
-            out_dim = stem_dim if i < self.upsample_steps - 1 else stem_dim
+            step = step - 1 if (step - 1) >= 1 else 1
+            out_dim = stem_dim * step if i < self.upsample_steps - 1 else stem_dim
             scale_t = 2 if i < t_upsample else 1
             scale_h = 2 if i < h_upsample else 1
             scale_w = 2 if i < w_upsample else 1
