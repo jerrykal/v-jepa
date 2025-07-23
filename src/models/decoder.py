@@ -25,7 +25,11 @@ class VideoDecoder(nn.Module):
         self.Nw = width // patch_size
         self.N = self.Nh * self.Nw
 
+        # decoder input shape: [B, t*N, C] → [B, C, t, Nh, Nw]
         self.restructure = lambda x, B: x.view(B, self.t_latent, self.N, embed_dim).transpose(2, 3).reshape(B, embed_dim, self.t_latent, self.Nh, self.Nw)
+
+        # project to stem_dim * num_layers
+        self.proj = nn.Conv3d(embed_dim, stem_dim * num_layers, kernel_size=1)
 
         # calculate required upsampling steps
         self.t_scale = tubelet_size
