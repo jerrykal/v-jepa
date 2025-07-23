@@ -31,7 +31,7 @@ data_aug:
   reprob: 0.0
 
 logging:
-  folder: /home/cgv/Documents/project/EmbodiedAgent/v-jepa/logs/ac_wm
+  folder: logs/decoder
   write_tag: deocder
 
 loss:
@@ -65,7 +65,7 @@ meta:
 model:
   model_name: vit_huge
   uniform_power: true
-  decoder_layers: 2
+  decoder_layers: 4
   decoder_stem_dim: 16
   training_model_list: ["encoder", "decoder"]
 
