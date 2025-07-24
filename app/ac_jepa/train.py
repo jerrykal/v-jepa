@@ -334,8 +334,9 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder)
     target_encoder = DistributedDataParallel(target_encoder)
 
-    for p in encoder.parameters():
-        p.requires_grad = False
+    if pre_train_model:
+        for p in encoder.parameters():
+            p.requires_grad = False
     for p in target_encoder.parameters():
         p.requires_grad = False
 
