@@ -7,7 +7,7 @@ from torch.nn.functional import mse_loss
 from einops.layers.torch import Rearrange
 from src.models.utils.modules import SpatialAttention, TemporalAttention
 from src.models.attentive_pooler import AttentivePooler
-from src.models.utils.quantization import LookupFreeQuantization
+from src.models.utils.quantization import LookupFreeQuantization, VectorQuantization
 from src.models.predictor import vit_predictor
 
 REPR_ACT_ENC = (
@@ -83,14 +83,21 @@ class LatentActionEncoder(nn.Module):
         # )
 
         # Build the quantization module
-        self.quant = LookupFreeQuantization(
-            input_dim           = inp_dims,
-            codebook_dim        = d_codebook,
-            num_codebook        = n_codebook,
-            use_bias            = lfq_bias,
-            commit_weight       = lfq_commit_weight,
-            entropy_weight      = lfq_entropy_weight,
-            diversity_weight    = lfq_diversity_weight,
+        # TODO: Refactor the parameters to match vector quantization instead of lookup-free quantization, e.g. change lfq_commit_weight to vq_commit_weight
+        # self.quant = LookupFreeQuantization(
+        #     input_dim           = inp_dims,
+        #     codebook_dim        = d_codebook,
+        #     num_codebook        = n_codebook,
+        #     use_bias            = lfq_bias,
+        #     commit_weight       = lfq_commit_weight,
+        #     entropy_weight      = lfq_entropy_weight,
+        #     diversity_weight    = lfq_diversity_weight,
+        # )
+        self.quant = VectorQuantization(
+            embedding_dim=d_codebook,
+            input_dim=inp_dims,
+            num_embeddings=n_codebook,
+            commitment_cost=lfq_commit_weight,
         )
         
         self.d_codebook = d_codebook
