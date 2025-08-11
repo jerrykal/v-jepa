@@ -31,7 +31,7 @@ data_aug:
   reprob: 0.0
 
 logging:
-  folder: logs/diffusion_decoder
+  folder: logs/diffusion_decoder_vitl16
   write_tag: diffusion_decoder
 
 meta:
