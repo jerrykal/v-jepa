@@ -127,7 +127,6 @@ def init_models(
     crop_size: int = 224,
     uniform_power: bool = False,
     use_sdpa: bool = False,
-    jepa_conditioned: bool = True,
     in_channels: int = 3,
     out_channels: int = 3,
     layers_per_block: int = 2,
@@ -160,7 +159,6 @@ def init_models(
     encoder = MultiMaskWrapper(encoder)
 
     # Diffusion decoder and noise scheduler
-    # TODO: set args by config instead of hardcoding
     unet, noise_scheduler = get_unet_and_scheduler(
         sample_size=crop_size,
         in_channels=in_channels,
@@ -170,7 +168,6 @@ def init_models(
         down_block_types=down_block_types,
         up_block_types=up_block_types,
         cross_attention_dim=encoder.backbone.embed_dim,
-        jepa_conditioned=jepa_conditioned,
         scheduler_beta_start=scheduler_beta_start,
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,

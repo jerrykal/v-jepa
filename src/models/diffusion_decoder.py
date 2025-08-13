@@ -78,38 +78,22 @@ def get_unet_and_scheduler(
     block_out_channels: tuple[int, ...],
     down_block_types: tuple[str, ...],
     up_block_types: tuple[str, ...],
-    cross_attention_dim: int | None = None,
-    jepa_conditioned: bool = True,
+    cross_attention_dim: int,
     scheduler_beta_start: float = 0.00085,
     scheduler_beta_end: float = 0.012,
     scheduler_beta_schedule: str = "scaled_linear",
     scheduler_prediction_type: str = "epsilon",
 ):
-    assert cross_attention_dim is not None or jepa_conditioned is False, (
-        "cross_attention_dim must be provided if jepa_conditioned is True"
+    unet = UNet2DConditionModel(
+        sample_size=sample_size,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        layers_per_block=layers_per_block,
+        block_out_channels=block_out_channels,
+        down_block_types=down_block_types,
+        up_block_types=up_block_types,
+        cross_attention_dim=cross_attention_dim,
     )
-
-    if jepa_conditioned:
-        unet = UNet2DConditionModel(
-            sample_size=sample_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            layers_per_block=layers_per_block,
-            block_out_channels=block_out_channels,
-            down_block_types=down_block_types,
-            up_block_types=up_block_types,
-            cross_attention_dim=cross_attention_dim,
-        )
-    else:
-        unet = UNet2DModel(
-            sample_size=sample_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            layers_per_block=layers_per_block,
-            block_out_channels=block_out_channels,
-            down_block_types=down_block_types,
-            up_block_types=up_block_types,
-        )
     noise_scheduler = PNDMScheduler(
         beta_start=scheduler_beta_start,
         beta_end=scheduler_beta_end,

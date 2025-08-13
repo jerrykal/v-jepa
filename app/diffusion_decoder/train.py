@@ -91,7 +91,6 @@ def main(args, resume_preempt=False):
 
     # -- DIFFUSION
     cfgs_diffusion = args.get("diffusion")
-    jepa_conditioned = cfgs_diffusion.get("jepa_conditioned", True)
     in_channels = cfgs_diffusion.get("in_channels", 3)
     out_channels = cfgs_diffusion.get("out_channels", 3)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
@@ -225,7 +224,6 @@ def main(args, resume_preempt=False):
         model_name=model_name,
         crop_size=crop_size,
         use_sdpa=use_sdpa,
-        jepa_conditioned=jepa_conditioned,
         in_channels=in_channels,
         out_channels=out_channels,
         layers_per_block=layers_per_block,

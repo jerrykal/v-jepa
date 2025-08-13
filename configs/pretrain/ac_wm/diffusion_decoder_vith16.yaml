@@ -47,7 +47,6 @@ model:
   uniform_power: true
 
 diffusion:
-  jepa_conditioned: true
   in_channels: 3
   out_channels: 3
   layers_per_block: 2
