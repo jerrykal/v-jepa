@@ -95,7 +95,7 @@ def main(args, resume_preempt=False):
     in_channels = cfgs_diffusion.get("in_channels", 3)
     out_channels = cfgs_diffusion.get("out_channels", 3)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
-    block_out_channels = cfgs_diffusion.get("block_out_channels", (64, 128, 256, 256))
+    block_out_channels = cfgs_diffusion.get("block_out_channels", (64, 128, 256, 512))
     down_block_types = cfgs_diffusion.get(
         "down_block_types",
         (
