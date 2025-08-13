@@ -71,6 +71,7 @@ def main(args, resume_preempt=False):
     save_every_freq = cfgs_meta.get("save_every_freq", -1)
     skip_batches = cfgs_meta.get("skip_batches", -1)
     use_sdpa = cfgs_meta.get("use_sdpa", False)
+    gradient_checkpointing = cfgs_meta.get("gradient_checkpointing", False)
     which_dtype = cfgs_meta.get("dtype")
     pre_train_model = cfgs_meta.get("pre_train_model", None)
     logger.info(f"{which_dtype=}")
@@ -235,6 +236,8 @@ def main(args, resume_preempt=False):
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
     )
+    if gradient_checkpointing:
+        unet.enable_gradient_checkpointing()
 
     # -- make data transforms
     transform = make_transforms(

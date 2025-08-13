@@ -41,6 +41,7 @@ meta:
   use_sdpa: true
   dtype: bfloat16
   pre_train_model: weights/vith16.pth.tar
+  gradient_checkpointing: true
 
 model:
   model_name: vit_huge
