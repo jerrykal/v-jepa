@@ -5,7 +5,7 @@ tasks_per_node: 8
 data:
   dataset_type: VideoDataset
   datasets:
-    - data/CLIP4MC_Dataset/export.csv
+    - data/CLIP4MC_Dataset/eval.csv
   decode_one_clip: true #not using
   batch_size: 1
   num_clips: 1
