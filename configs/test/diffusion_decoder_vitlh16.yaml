@@ -19,17 +19,6 @@ data:
   filter_short_videos: false
   clip_duration: null
 
-data_aug:
-  auto_augment: false
-  motion_shift: false
-  random_resize_aspect_ratio:
-  - 0.75
-  - 1.35
-  random_resize_scale:
-  - 0.3
-  - 1.0
-  reprob: 0.0
-
 meta:
   save_dir: logs/test/diffusion_decoder_vith16
   read_checkpoint: logs/train/diffusion_decoder_vith16/diffusion_decoder-latest.pth.tar

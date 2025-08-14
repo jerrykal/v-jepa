@@ -13,8 +13,9 @@ from einops import rearrange
 from PIL import Image
 from tqdm import tqdm
 
+import src.datasets.utils.video.transforms as video_transforms
+import src.datasets.utils.video.volume_transforms as volume_transforms
 from app.diffusion_decoder.utils import init_models, load_checkpoint, load_jepa_encoder
-from app.vjepa.transforms import make_transforms
 from src.datasets.data_manager import init_data
 from src.models.diffusion_decoder import JEPADecoderPipeline
 from src.utils.logging import get_logger
@@ -39,7 +40,8 @@ def save_tensor_as_gif(tensor, output_path, duration=100):
     Save a tensor as a GIF file.
     """
     # Convert from tensor to numpy and scale to 0-255
-    tensor_np = tensor.cpu().numpy().astype(np.uint8)
+    tensor_np = tensor.cpu().numpy()
+    tensor_np = (tensor_np * 255).astype(np.uint8)
 
     # Transpose from (C, T, H, W) to (T, H, W, C) for PIL
     tensor_np = tensor_np.transpose(1, 2, 3, 0)
@@ -144,14 +146,6 @@ def main() -> None:
     filter_short_videos = cfgs_data.get("filter_short_videos", False)
     decode_one_clip = cfgs_data.get("decode_one_clip", True)
 
-    # -- DATA AUGS
-    cfgs_data_aug = configs.get("data_aug")
-    ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])
-    rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0])
-    motion_shift = cfgs_data_aug.get("motion_shift", False)
-    reprob = cfgs_data_aug.get("reprob", 0.0)
-    use_aa = cfgs_data_aug.get("auto_augment", False)
-
     # -- INFERENCE
     cfgs_inference = configs.get("inference")
     num_inference_steps = cfgs_inference.get("num_inference_steps", 50)
@@ -165,14 +159,16 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
 
     # Make data transforms
-    transform = make_transforms(
-        random_horizontal_flip=True,
-        random_resize_aspect_ratio=ar_range,
-        random_resize_scale=rr_scale,
-        reprob=reprob,
-        auto_augment=use_aa,
-        motion_shift=motion_shift,
-        crop_size=crop_size,
+    short_side_size = int(crop_size * 256 / 224)
+    normalize_mean = torch.tensor([0.485, 0.456, 0.406])
+    normalize_std = torch.tensor([0.229, 0.224, 0.225])
+    transform = video_transforms.Compose(
+        [
+            video_transforms.Resize(short_side_size, interpolation="bilinear"),
+            video_transforms.CenterCrop(size=(crop_size, crop_size)),
+            volume_transforms.ClipToTensor(),
+            video_transforms.Normalize(mean=normalize_mean, std=normalize_std),
+        ]
     )
 
     # Init data-loaders/samplers
@@ -187,6 +183,7 @@ def main() -> None:
         decode_one_clip=decode_one_clip,
         duration=duration,
         num_clips=num_clips,
+        random_clip_sampling=False,
         transform=transform,
         datasets_weights=datasets_weights,
         collator=None,
@@ -282,9 +279,9 @@ def main() -> None:
         reconstructed_images = reconstructed_images.permute(1, 0, 2, 3)
 
         # Unnormalize the clips and reconstructed images for visualization
-        clips_unnormalized = unnormalize_tensor(clips, transform.mean, transform.std)
+        clips_unnormalized = unnormalize_tensor(clips, normalize_mean, normalize_std)
         reconstructed_unnormalized = unnormalize_tensor(
-            reconstructed_images, transform.mean, transform.std
+            reconstructed_images, normalize_mean, normalize_std
         )
 
         # Save both original and reconstructed images side by side
