@@ -400,14 +400,23 @@ def main(args, resume_preempt=False):
                         encoder_hidden_states, (encoder_hidden_states.size(-1),)
                     )
 
-                    # Reshape the encoder output to be [B * T, N, D]
                     N_t = num_frames // tubelet_size
                     encoder_hidden_states = rearrange(
-                        encoder_hidden_states, "b (t n) d -> (b t) n d", t=N_t
+                        encoder_hidden_states, "b (t n) d -> b t n d", t=N_t
+                    )
+
+                    # Repeat the encoder hidden states for each tubelet
+                    encoder_hidden_states = encoder_hidden_states.repeat_interleave(
+                        repeats=tubelet_size, dim=1
+                    )
+
+                    # Reshape the encoder output to be [B * T, N, D]
+                    encoder_hidden_states = rearrange(
+                        encoder_hidden_states, "b t n d -> (b t) n d"
                     )
 
                     # NOTE: We chose to use the last frame of each tubelet as the target image.
-                    clean_images = clips[:, :, tubelet_size - 1 :: tubelet_size, :, :]
+                    clean_images = clips.clone()
                     clean_images = rearrange(clean_images, "b c t h w -> (b t) c h w")
 
                     # Sample noise that we'll add to the images
@@ -425,6 +434,11 @@ def main(args, resume_preempt=False):
                         device=device,
                     ).long()
 
+                    # Create class labels indicating which frame in the tubelet we are reconstructing
+                    class_labels = torch.arange(tubelet_size, device=device).repeat(
+                        bsz // tubelet_size
+                    )
+
                     # Add noise to the clean images
                     noisy_images = noise_scheduler.add_noise(
                         clean_images, noise, timesteps
@@ -435,6 +449,7 @@ def main(args, resume_preempt=False):
                         noisy_images,
                         timesteps,
                         encoder_hidden_states,
+                        class_labels,
                         return_dict=False,
                     )[0]
 

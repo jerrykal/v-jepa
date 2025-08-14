@@ -16,7 +16,8 @@ class JEPADecoderPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        jepa_features: torch.Tensor | None = None,
+        encoder_hidden_states: torch.Tensor | None = None,
+        class_labels: torch.Tensor | None = None,
         num_inference_steps: int = 50,
         generator: torch.Generator | None = None,
     ):
@@ -35,31 +36,24 @@ class JEPADecoderPipeline(DiffusionPipeline):
             image_shape,
             generator=generator,
             device=self._execution_device,
-            dtype=jepa_features.dtype,
+            dtype=encoder_hidden_states.dtype,
         )
 
         # Repeat the noise so that each image in the clip is denoised from the same noise
-        noisy_images = noisy_images.repeat(jepa_features.shape[0], 1, 1, 1)
+        noisy_images = noisy_images.repeat(encoder_hidden_states.shape[0], 1, 1, 1)
 
         # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for t in timesteps:
                 model_input = self.scheduler.scale_model_input(noisy_images, t)
 
-                if isinstance(self.unet, UNet2DConditionModel):
-                    noise_pred = self.unet(
-                        model_input,
-                        timestep=t,
-                        encoder_hidden_states=jepa_features,
-                        return_dict=False,
-                    )[0]
-                else:
-                    noise_pred = self.unet(
-                        model_input,
-                        timestep=t,
-                        return_dict=False,
-                    )[0]
-
+                noise_pred = self.unet(
+                    model_input,
+                    timestep=t,
+                    encoder_hidden_states=encoder_hidden_states,
+                    class_labels=class_labels,
+                    return_dict=False,
+                )[0]
                 noisy_images = self.scheduler.step(
                     noise_pred, t, noisy_images, return_dict=False
                 )[0]
@@ -79,6 +73,7 @@ def get_unet_and_scheduler(
     down_block_types: tuple[str, ...],
     up_block_types: tuple[str, ...],
     cross_attention_dim: int,
+    num_class_embeds: int,
     scheduler_beta_start: float = 0.00085,
     scheduler_beta_end: float = 0.012,
     scheduler_beta_schedule: str = "scaled_linear",
@@ -93,6 +88,7 @@ def get_unet_and_scheduler(
         down_block_types=down_block_types,
         up_block_types=up_block_types,
         cross_attention_dim=cross_attention_dim,
+        num_class_embeds=num_class_embeds,
     )
     noise_scheduler = PNDMScheduler(
         beta_start=scheduler_beta_start,

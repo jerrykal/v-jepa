@@ -248,19 +248,32 @@ def main() -> None:
                 encoder_hidden_states, (encoder_hidden_states.size(-1),)
             )
 
-            # Reshape the encoder output to be [B * T, N, D]
             N_t = num_frames // tubelet_size
             encoder_hidden_states = rearrange(
-                encoder_hidden_states, "b (t n) d -> (b t) n d", t=N_t
+                encoder_hidden_states, "b (t n) d -> b t n d", t=N_t
             )
+
+            # Repeat the encoder hidden states for each tubelet
+            encoder_hidden_states = encoder_hidden_states.repeat_interleave(
+                repeats=tubelet_size, dim=1
+            )
+
+            # Reshape the encoder output to be [B * T, N, D]
+            encoder_hidden_states = rearrange(
+                encoder_hidden_states, "b t n d -> (b t) n d"
+            )
+
+            # Create class labels indicating which frame in the tubelet we are reconstructing
+            class_labels = torch.arange(tubelet_size, device=device).repeat(
+                encoder_hidden_states.shape[0] // tubelet_size
+            )
+
             reconstructed_images = pipeline(
-                jepa_features=encoder_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                class_labels=class_labels,
                 num_inference_steps=num_inference_steps,
                 generator=torch.Generator(device=device).manual_seed(seed),
             )
-
-        # NOTE: we only saves the latest frame of each tubelet since that is the target frame for our current decoder architecture
-        clips = clips[:, :, tubelet_size - 1 :: tubelet_size, :, :]
 
         # Rearrange both clips and reconstructed images to be (C, T, H, W)
         clips = rearrange(clips, "b c t h w -> c (b t) h w")
