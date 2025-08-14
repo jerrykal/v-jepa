@@ -292,7 +292,6 @@ def main(args, resume_preempt=False):
         betas=betas,
         eps=eps,
     )
-    unet = DistributedDataParallel(unet, static_graph=True)
 
     # -- freeze encoder
     for p in encoder.parameters():
@@ -321,6 +320,9 @@ def main(args, resume_preempt=False):
         )
         for _ in range(start_epoch * ipe):
             lr_scheduler.step()
+
+    # -- wrap unet with DDP
+    unet = DistributedDataParallel(unet, static_graph=True)
 
     def save_checkpoint(epoch, path):
         if rank != 0:
