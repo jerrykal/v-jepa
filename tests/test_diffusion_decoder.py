@@ -13,8 +13,9 @@ from einops import rearrange
 from PIL import Image
 from tqdm import tqdm
 
-from app.diffusion_decoder.train import init_data, make_transforms
 from app.diffusion_decoder.utils import init_models, load_checkpoint, load_jepa_encoder
+from app.vjepa.transforms import make_transforms
+from src.datasets.data_manager import init_data
 from src.models.diffusion_decoder import JEPADecoderPipeline
 from src.utils.logging import get_logger
 
@@ -231,6 +232,7 @@ def main() -> None:
     # Create diffusion pipeline
     pipeline = JEPADecoderPipeline(unet=unet, scheduler=noise_scheduler)
     pipeline = pipeline.to(device)
+    pipeline.set_progress_bar_config(disable=True)
     logger.info("Created diffusion pipeline")
 
     unsupervised_loader = iter(unsupervised_loader)
