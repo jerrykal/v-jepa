@@ -31,8 +31,8 @@ data_aug:
   reprob: 0.0
 
 meta:
-  save_dir: logs/test_diffusion_decoder_vith16
-  read_checkpoint: logs/diffusion_decoder_vith16/diffusion_decoder-latest.pth.tar
+  save_dir: logs/test/diffusion_decoder_vith16
+  read_checkpoint: logs/train/diffusion_decoder_vith16/diffusion_decoder-latest.pth.tar
   seed: 234
   eval_freq: 100
   use_sdpa: true
