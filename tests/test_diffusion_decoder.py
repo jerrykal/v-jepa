@@ -57,7 +57,6 @@ def save_tensor_as_gif(tensor, output_path, duration=100):
         duration=duration,
         loop=0,
     )
-    logger.info(f"Saved video to {output_path}")
 
 
 @torch.no_grad()
