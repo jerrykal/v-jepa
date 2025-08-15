@@ -400,30 +400,19 @@ def main(args, resume_preempt=False):
                         encoder_hidden_states, (encoder_hidden_states.size(-1),)
                     )
 
-                    N_t = num_frames // tubelet_size
-                    encoder_hidden_states = rearrange(
-                        encoder_hidden_states, "b (t n) d -> b t n d", t=N_t
-                    )
-
-                    # Repeat the encoder hidden states for each tubelet
+                    # (B, L, D) -> (B * num_frames, L, D), L is the number of patches, D is the embedding dimension
                     encoder_hidden_states = encoder_hidden_states.repeat_interleave(
-                        repeats=tubelet_size, dim=1
+                        num_frames, dim=0
                     )
 
-                    # Reshape the encoder output to be [B * T, N, D]
-                    encoder_hidden_states = rearrange(
-                        encoder_hidden_states, "b t n d -> (b t) n d"
-                    )
-
-                    # NOTE: We chose to use the last frame of each tubelet as the target image.
                     clean_images = clips.clone()
-                    clean_images = rearrange(clean_images, "b c t h w -> (b t) c h w")
+                    clean_images = rearrange(clean_images, "b c f h w -> (b f) c h w")
 
                     # Sample noise that we'll add to the images
                     noise = torch.randn_like(clean_images, dtype=dtype, device=device)
 
                     # NOTE: The batch size here is different from the batch size of the data loader.
-                    #       The precise batch size here is batch_size * N_t.
+                    #       The precise batch size here is batch_size * num_frames.
                     bsz = clean_images.shape[0]
 
                     # Sample a random timestep for each image
@@ -434,10 +423,8 @@ def main(args, resume_preempt=False):
                         device=device,
                     ).long()
 
-                    # Create class labels indicating which frame in the tubelet we are reconstructing
-                    class_labels = torch.arange(tubelet_size, device=device).repeat(
-                        bsz // tubelet_size
-                    )
+                    # Create class labels indicating which frame we are reconstructing
+                    class_labels = torch.arange(num_frames, device=device)
 
                     # Add noise to the clean images
                     noisy_images = noise_scheduler.add_noise(

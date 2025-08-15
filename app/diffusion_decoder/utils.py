@@ -168,7 +168,7 @@ def init_models(
         down_block_types=down_block_types,
         up_block_types=up_block_types,
         cross_attention_dim=encoder.backbone.embed_dim,
-        num_class_embeds=tubelet_size,
+        num_class_embeds=num_frames,
         scheduler_beta_start=scheduler_beta_start,
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,

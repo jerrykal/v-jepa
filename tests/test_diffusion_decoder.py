@@ -246,25 +246,13 @@ def main() -> None:
                 encoder_hidden_states, (encoder_hidden_states.size(-1),)
             )
 
-            N_t = num_frames // tubelet_size
-            encoder_hidden_states = rearrange(
-                encoder_hidden_states, "b (t n) d -> b t n d", t=N_t
-            )
-
-            # Repeat the encoder hidden states for each tubelet
+            # (B, L, D) -> (B * num_frames, L, D), L is the number of patches, D is the embedding dimension
             encoder_hidden_states = encoder_hidden_states.repeat_interleave(
-                repeats=tubelet_size, dim=1
+                num_frames, dim=0
             )
 
-            # Reshape the encoder output to be [B * T, N, D]
-            encoder_hidden_states = rearrange(
-                encoder_hidden_states, "b t n d -> (b t) n d"
-            )
-
-            # Create class labels indicating which frame in the tubelet we are reconstructing
-            class_labels = torch.arange(tubelet_size, device=device).repeat(
-                encoder_hidden_states.shape[0] // tubelet_size
-            )
+            # Create class labels indicating which frame we are reconstructing
+            class_labels = torch.arange(num_frames, device=device)
 
             reconstructed_images = pipeline(
                 encoder_hidden_states=encoder_hidden_states,
@@ -273,7 +261,7 @@ def main() -> None:
                 generator=torch.Generator(device=device).manual_seed(seed),
             )
 
-        # Rearrange both clips and reconstructed images to be (C, T, H, W)
+        # Rearrange both clips and reconstructed images to be (C, F, H, W)
         clips = rearrange(clips, "b c t h w -> c (b t) h w")
         reconstructed_images = reconstructed_images.permute(1, 0, 2, 3)
 
