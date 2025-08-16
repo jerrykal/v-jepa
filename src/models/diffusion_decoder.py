@@ -1,12 +1,12 @@
 import torch
-from diffusers import PNDMScheduler, UNet2DConditionModel, UNet2DModel
+from diffusers import PNDMScheduler, UNet2DConditionModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
 
 class JEPADecoderPipeline(DiffusionPipeline):
     def __init__(
         self,
-        unet: UNet2DConditionModel | UNet2DModel,
+        unet: UNet2DConditionModel,
         scheduler: PNDMScheduler,
     ):
         super().__init__()
