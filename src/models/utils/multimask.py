@@ -6,11 +6,15 @@
 #
 
 import torch.nn as nn
+from src.models.latent_action import LatentActionEncoder
+from src.models.vision_transformer import VisionTransformer
+from src.models.predictor import VisionTransformerPredictor
+
 
 
 class MultiMaskWrapper(nn.Module):
 
-    def __init__(self, backbone):
+    def __init__(self, backbone:VisionTransformer):
         super().__init__()
         self.backbone = backbone
 
@@ -28,7 +32,7 @@ class MultiMaskWrapper(nn.Module):
 
 class PredictorMultiMaskWrapper(nn.Module):
 
-    def __init__(self, backbone):
+    def __init__(self, backbone:VisionTransformerPredictor):
         super().__init__()
         self.backbone = backbone
 
@@ -41,6 +45,8 @@ class PredictorMultiMaskWrapper(nn.Module):
             masks_ctxt = [masks_ctxt]
         if type(masks_tgt) is not list:
             masks_tgt = [masks_tgt]
+        if type(act) is not list:
+            act = [act]
 
         outs = []
         for i, (zi, hi, mc, mt, ac) in enumerate(zip(ctxt, tgt, masks_ctxt, masks_tgt, act)):
@@ -49,7 +55,7 @@ class PredictorMultiMaskWrapper(nn.Module):
 
 
 class LatentActionEncoderMultiMaskWrapper(nn.Module):
-    def __init__(self, backbone):
+    def __init__(self, backbone:LatentActionEncoder):
         super().__init__()
         self.backbone = backbone
 

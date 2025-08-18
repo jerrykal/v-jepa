@@ -7,7 +7,7 @@ class ReplayBuffer():
     def __init__(self, 
                  obs_shape, action_dims, 
                  num_envs, 
-                 max_length=int(1E6), warmup_length=50000, frame_skip=4,
+                 max_length=int(1E5), warmup_length=50000, frame_skip=4,
                  store_on_gpu=True,
                  device="cpu") -> None:
         self.store_on_gpu = store_on_gpu
@@ -134,10 +134,10 @@ class ReplayBuffer():
                 reward.append(external_reward)
                 termination.append(external_termination)
 
-            obs = rearrange(torch.from_numpy(np.concatenate(obs, axis=0)).float().cuda() / 255, "B T H W C -> B C T H W")
-            action = torch.from_numpy(np.concatenate(action, axis=0)).cuda()
-            reward = torch.from_numpy(np.concatenate(reward, axis=0)).cuda()
-            termination = torch.from_numpy(np.concatenate(termination, axis=0)).cuda()
+            obs = rearrange(torch.from_numpy(np.concatenate(obs, axis=0)).float().to(to_device) / 255, "B T H W C -> B C T H W")
+            action = torch.from_numpy(np.concatenate(action, axis=0)).to(to_device)
+            reward = torch.from_numpy(np.concatenate(reward, axis=0)).to(to_device)
+            termination = torch.from_numpy(np.concatenate(termination, axis=0)).to(to_device)
         return obs, action, reward, termination
 
     def append(self, obs, action, reward, termination):
@@ -182,8 +182,8 @@ class ReplayBuffer():
                             done=done)
         print(f"Buffer exported to {file_path} (npz compressed)")
 
-    def load_buffer(self, file_path):
-        buffer = np.load(file_path)
+    def load_buffer(self, path):
+        buffer = np.load(path)
 
         self.length = buffer["obs"].shape[0]//2
         self.external_buffer_length = None  # reset
@@ -204,7 +204,7 @@ class ReplayBuffer():
             self.action_buffer[:self.length] = action
             self.reward_buffer[:self.length] = reward
             self.termination_buffer[:self.length] = done
-        print(f"Buffer loaded from {file_path}, length={self.length}")
+        print(f"Buffer loaded from {path}, length={self.length}")
 
 
     def __len__(self):

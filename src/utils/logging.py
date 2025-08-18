@@ -10,6 +10,7 @@ import sys
 
 import torch
 
+from tensorboardX import SummaryWriter
 
 def gpu_timer(closure, log_timings=True):
     """ Helper to time gpu-time to execute closure() """
@@ -116,3 +117,30 @@ def adamw_logger(optimizer):
         exp_avg_stats.update(float(s.get('exp_avg').abs().mean()))
         exp_avg_sq_stats.update(float(s.get('exp_avg_sq').abs().mean()))
     return {'exp_avg': exp_avg_stats, 'exp_avg_sq': exp_avg_sq_stats}
+
+
+class TensorboardLogger():
+    def __init__(self) -> None:
+        self._writer = SummaryWriter(logdir=path, flush_secs=1)
+        self._tag_step = {}
+
+
+    def _log_count(self, tag):
+        self._tag_step[tag] = 0 if tag not in self._tag_step else self._tag_step[tag] + 1
+        return self._tag_step[tag]
+
+    def log(self, tag, value, type='scalar', step=None, **kwargs):
+        _step = self._log_count(tag, step)
+        _tag = f"{type}/{tag}"
+        if type == 'scalar':
+            self._writer.add_scalar(_tag, value, _step)
+        elif type == 'image':
+            self._writer.add_images(_tag, value, _step)
+        elif type == 'video':
+            fps = kwargs.get('fps', 15)
+            self._writer.add_video(_tag, value, _step, fps=fps)
+        else:
+            raise ValueError(f"Unsupported log type: {type}")
+
+    def close(self):
+        self._writer.close()

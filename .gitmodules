@@ -1,0 +1,3 @@
+[submodule "libs/mine_env"]
+	path = libs/mine_env
+	url = https://github.com/yChang0609/MineDojo_PPOBenchHub.git

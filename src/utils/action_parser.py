@@ -79,62 +79,110 @@ class ActionParser:
         ActionParser._initialized = True
 
     @staticmethod
-    def encode(raw_action: list | dict) -> torch.Tensor:
-        '''
-        Encode raw action into one-hot tensor.
-
-        Args:
-            raw_action: list or dict, format depends on init mode
-
-        Returns:
-            1D tensor [total_dim]
-        '''
+    def encode(raw_action: list | dict | torch.Tensor) -> torch.Tensor:
         ActionParser._check_initialized()
 
         if ActionParser._use_named_keys:
+            # 仍只支持单样本 dict（如需 dict 的批/序列，后续可按同思路扩展）
             assert isinstance(raw_action, dict), "Expected dict input."
             one_hots = []
             for cat in ActionParser.category_list:
                 idx = ActionParser.value_to_index[cat][raw_action[cat]]
                 one_hot = F.one_hot(torch.tensor(idx), num_classes=len(ActionParser.action_dict[cat]))
                 one_hots.append(one_hot)
-        else:
-            assert isinstance(raw_action, list), "Expected list input."
-            one_hots = []
-            for i, idx in enumerate(raw_action):
-                dim = ActionParser.action_dims[i]
-                one_hot = F.one_hot(torch.tensor(idx), num_classes=dim)
-                one_hots.append(one_hot)
+            return torch.cat(one_hots).float()
 
-        return torch.cat(one_hots).float()
+        dims = ActionParser.action_dims
+        C = len(dims)
+
+        if isinstance(raw_action, list):
+            ra = torch.tensor(raw_action, dtype=torch.long)
+        elif isinstance(raw_action, torch.Tensor):
+            ra = raw_action.to(dtype=torch.long)
+        else:
+            raise TypeError("In list mode, raw_action must be list or torch.Tensor.")
+
+        if ra.ndim == 1:
+            # [C]
+            assert ra.numel() == C, f"Expected {C} categories, got {ra.numel()}."
+            parts = [F.one_hot(ra[i], num_classes=dims[i]) for i in range(C)]
+            return torch.cat(parts, dim=0).float()  # [total_dim]
+        elif ra.ndim == 2:
+            # [B, C]
+            B, C_in = ra.shape
+            assert C_in == C, f"Expected {C} categories, got {C_in}."
+            parts = [F.one_hot(ra[:, i], num_classes=dims[i]) for i in range(C)]  # [B, dim_i]
+            return torch.cat(parts, dim=1).float()  # [B, total_dim]
+        elif ra.ndim == 3:
+            B, L, C_in = ra.shape
+            assert C_in == C, f"Expected {C} categories, got {C_in}."
+            ra2 = ra.reshape(B * L, C) 
+            parts = [F.one_hot(ra2[:, i], num_classes=dims[i]) for i in range(C)]  # [B*L, dim_i]
+            out = torch.cat(parts, dim=1).float()  # [B*L, total_dim]
+            return out.reshape(B, L, -1)  # [B, L, total_dim]
+
+        else:
+            raise ValueError(f"Unsupported raw_action.ndim={ra.ndim}; expected 1, 2 or 3 in list mode.")
 
     @staticmethod
     def decode(tensor: torch.Tensor) -> list | dict:
-        '''
-        Decode one-hot tensor back to structured raw action.
-
-        Args:
-            tensor: 1D tensor [total_dim]
-
-        Returns:
-            list or dict, depending on init mode
-        '''
         ActionParser._check_initialized()
 
-        result = {} if ActionParser._use_named_keys else []
-        start = 0
-        for cat, dim in zip(ActionParser.category_list, ActionParser.action_dims):
-            sub = tensor[start:start+dim]
-            idx = torch.argmax(sub).item()
-            val = ActionParser.index_to_value[cat][idx]
-            if ActionParser._use_named_keys:
-                result[cat] = val
-            else:
-                result.append(idx)
-            start += dim
-        return result
+        dims = ActionParser.action_dims
+        total = sum(dims)
 
+        if ActionParser._use_named_keys:
+            assert tensor.ndim == 1 and tensor.numel() == total, \
+                f"Expected 1D tensor of length {total} for dict mode."
+            result = {}
+            start = 0
+            for cat, dim in zip(ActionParser.category_list, dims):
+                sub = tensor[start:start+dim]
+                idx = int(torch.argmax(sub))
+                result[cat] = ActionParser.index_to_value[cat][idx]
+                start += dim
+            return result
+
+        if tensor.ndim == 1:
+            assert tensor.numel() == total, f"Expected total_dim={total}, got {tensor.numel()}."
+            out = []
+            start = 0
+            for cat, dim in zip(ActionParser.category_list, dims):
+                sub = tensor[start:start+dim]
+                idx = int(torch.argmax(sub))
+                out.append(idx)
+                start += dim
+            return out  
+        elif tensor.ndim == 2:
+            # [B, total]
+            B, T = tensor.shape
+            assert T == total, f"Expected total_dim={total}, got {T}."
+            idx_parts = []
+            start = 0
+            for dim in dims:
+                sub = tensor[:, start:start+dim]         # [B, dim]
+                idx = torch.argmax(sub, dim=-1)          # [B]
+                idx_parts.append(idx)
+                start += dim
+            return torch.stack(idx_parts, dim=-1).tolist()  
+        elif tensor.ndim == 3:
+            B, L, T = tensor.shape
+            assert T == total, f"Expected total_dim={total}, got {T}."
+            idx_parts = []
+            start = 0
+            for dim in dims:
+                sub = tensor[..., start:start+dim]        # [B, L, dim]
+                idx = torch.argmax(sub, dim=-1)           # [B, L]
+                idx_parts.append(idx)
+                start += dim
+            return torch.stack(idx_parts, dim=-1).tolist()
+
+        else:
+            raise ValueError("decode expects tensor of shape [total], [B, total], or [B, L, total].")
+        
     @staticmethod
     def _check_initialized():
         if not ActionParser._initialized:
             raise RuntimeError("ActionParser not initialized. Call `ActionParser.init(...)` first.")
+        
+
