@@ -116,55 +116,29 @@ class WorldModel():
               sample_obs:torch.Tensor, sample_action:torch.Tensor,
               sample_rewards:torch.Tensor, sample_termin:torch.Tensor,
               ):
-        '''
-        Pseudo code:
-        B: batch size
-        
-        T: frame-level times
-        H: frame-level height
-        W: frame-level width
-        
-        t: patch-level times
-        h: patch-level height
-        w: patch-level width
-        P: h*w number of patch
-        N: t*P number of all patch on full video
-        D: latent dims of patch
-
-        >> Forward process
-        context obs = sample_action[:T-self.tubelet_size]
-        target encoder = sample_action
-
-        context latent = self._context_encoder(context obs)
-        target latent = self._target_encoder(target obs)
-
-        act = self._latent_act_encoder(target latent)
-        predicted latent =  self.predictor(z, h, masks_enc, masks_pred, act) #[B P D]
-
-        hat_rewards = self._rewards_decoder(predicted latent)
-        hat_termin = self._termin_decoder(predicted latent)
-        hat_act = self._action_projector(sample_action)
-
-        >> Loss calculate
-        action loss = KL_d loss(hat_act, act)
-        rewards loss = loss(hat_rewards, sample_rewards)
-        termin loss = loss(hat_termin, sample_termin)
-        
-        >> Backward
-        loss.backward()
-        optimizer.step()
-        .
-        .
-        .
-
-        return debug log
-        '''
+        """
+        One training step for the World Model.
+        Args:
+            sample_obs:     [B, C, T, H, W] - input video frames
+            sample_action:  [B, T, ...]     - action sequence
+            sample_rewards: [B, T]          - reward targets
+            sample_termin:  [B, T]          - termination targets
+        Returns:
+            dict of loss values, grad stats, optimizer state, lr/wd logs
+        """
+        # >> switch to train mode 
         self.train()
+
+         # step LR and WD schedulers
         _new_lr = self._lr_scheduler.step()
         _new_wd = self._wd_scheduler.step()
+
+        # get shapes
         B, C, T, H, W = sample_obs.shape
         t = T // self.tubelet_size
         p = (H // self.patch_size) * (W // self.patch_size)
+
+         # >> helper: build encoder/predictor masks 
         def build_masks():
             mask = torch.ones((t, p), dtype=torch.int32).to(sample_obs.device)
             mask[-1, :] = 0
@@ -173,43 +147,51 @@ class WorldModel():
             mask_e = torch.nonzero(mask).reshape(1, -1).expand(B, -1)
             return [mask_e], [mask_p]
         
+        # >> helper: run target encoder
         def forward_target(obs):
             z = self._target_encoder(obs)
             return z
-
+        
+        # >> helper: run latent action encoder & quantizer
         def forward_latent_action(target_z):
             x = [rearrange(_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size)) for _z in target_z] \
                 if isinstance(target_z, list) else \
                 rearrange(target_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size))
             moduls = self._latent_act_encoder.backbone
 
+            # pass through temporal encoder blocks
             for block in moduls.enc_layer:
                 x = block(x)  # [B, T, P, D]
             _B, _T, _P, _D = x.shape
+            
+            # flatten [B, T, P, D] -> [B, T*P, D]
             x = x.permute(0, 2, 1, 3).reshape(_B, _T * _P, _D)
             pooled = moduls.attention_pooler(x)
             pooled = pooled.squeeze(1)        # [B, D]
             (z_q, idx), _ = moduls.quant(pooled)
             return z_q, idx
         
+        # >> helper: context encoder + predictor 
         def forward_prediction(obs, mask_e, masks_p, act): 
             z = self._context_encoder(obs, mask_e)
             pred_z = self._predictor(z, None, mask_e, masks_p, act) 
             full_z = torch.concat([z[0], pred_z[0]],dim=1) # [B, ((t-1)*p) + p, D] = [B, (t*p), D]
             return pred_z[0], full_z
-
+        
+        # >> helper: project real action to latent space
         def forward_action_project(real_action):
             return self._action_projector(real_action)
-             
+        
+        # >> helper: decode reward from latent state
         def forward_rewards_decode(predicted_state):
             x = predicted_state[0] if isinstance(predicted_state, list) else predicted_state
             return self._rewards_decoder(self._state_pooler, x)
-
+        # >> helper: decode termination from latent state
         def forward_termin_decode(predicted_state):
             x = predicted_state[0] if isinstance(predicted_state, list) else predicted_state
             return self._termin_decoder(self._state_pooler, x)
         
-        # loss
+        # >> helper: loss wrappers 
         def action_loss_fn(real_act_embed, pseudo_act):
             return self._action_loss_fn(real_act_embed, pseudo_act)
     
@@ -219,8 +201,8 @@ class WorldModel():
         def termin_loss_fn(hat_termin, termin):
             return self._termin_loss_fn(hat_termin, termin)
 
+        # >> forward pass
         self._optimizer.zero_grad()
-        # forward
         with torch.amp.autocast(device_type=sample_obs.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
             mask_e, mask_p          = build_masks()
             target_z                = forward_target(sample_obs)
@@ -230,13 +212,16 @@ class WorldModel():
             hat_termins             = forward_termin_decode(full_z[:,self._num_last_frames*p:,])
             _, proj_quant_vec       = forward_action_project(sample_action[:,-1,:])
 
-            # L2 loss for hat action min distance with quantize vector 
+            # compute action target from quantizer codebook
             target_quant_vec = self._latent_act_encoder.backbone.quant.codebook(quant_idx)
             loss_action = action_loss_fn(proj_quant_vec, target_quant_vec)
             loss_reward = reward_loss_fn(hat_rewards, sample_rewards[:,-1])
             loss_termin = termin_loss_fn(hat_termins, sample_termin[:,-1])
 
+        # total loss
         loss = loss_action + loss_reward + loss_termin
+
+         # >> backward pass 
         _reward_decoder_norm = 0.
         _termin_decoder_norm = 0.
         _action_projector_norm = 0.
@@ -245,18 +230,21 @@ class WorldModel():
             self._scaler.unscale_(self._optimizer)
         else:
             loss.backward()
-
+        
+        # gradient clipping (only after warmup)
         if (self._step > self._warmup) and (self._clip_grad is not None):
             _reward_decoder_norm = torch.nn.utils.clip_grad_norm_(self._rewards_decoder.parameters(), self._clip_grad)
             _termin_decoder_norm = torch.nn.utils.clip_grad_norm_(self._termin_decoder.parameters(), self._clip_grad)
             _action_projector_norm = torch.nn.utils.clip_grad_norm_(self._action_projector.parameters(), self._clip_grad)
         
+        # optimizer step
         if self._use_amp:
             self._scaler.step(self._optimizer)
             self._scaler.update()
         else:
             self._optimizer.step()
 
+        # >> logging grad stats 
         grad_stats_reward = grad_logger(self._rewards_decoder.named_parameters())
         grad_stats_reward.global_norm = float(_reward_decoder_norm)
         grad_stats_termin = grad_logger(self._termin_decoder.named_parameters())
@@ -264,6 +252,7 @@ class WorldModel():
         grad_stats_action = grad_logger(self._action_projector.named_parameters())
         grad_stats_action.global_norm = float(_action_projector_norm)
 
+        # >> step counter + optimizer logging
         self._step +=1
         optim_stats = adamw_logger(self._optimizer)
 
@@ -272,7 +261,8 @@ class WorldModel():
             self._tb_logger.log("WorldModel/reward_loss", loss_reward.item())
             self._tb_logger.log("WorldModel/termination_loss", loss_termin.item())
             self._tb_logger.log("WorldModel/total_loss", loss.item())
-           
+
+        # >> return summary 
         return {
             "loss":{
                 "total":loss.item(),
