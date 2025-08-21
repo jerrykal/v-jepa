@@ -78,9 +78,6 @@ def main(args, resume_preempt=False):
     load_model = cfgs_meta.get('load_checkpoint') or resume_preempt
     ckpt_file = cfgs_meta.get('read_checkpoint', None)
     seed = cfgs_meta.get('seed', _GLOBAL_SEED)
-    save_every_freq = cfgs_meta.get('save_every_freq', -1)
-    # skip_batches = cfgs_meta.get('skip_batches', -1)
-    # use_sdpa = cfgs_meta.get('use_sdpa', False)
     which_dtype = cfgs_meta.get('dtype')
     logger.info(f'{which_dtype=}')
     if which_dtype.lower() == 'bfloat16':
@@ -92,10 +89,7 @@ def main(args, resume_preempt=False):
     else:
         dtype = torch.float32
         mixed_precision = False
-    pre_train_model = cfgs_meta.get('pre_train_model', None)
-
-    # # -- MASK
-    # cfgs_mask = args.get('mask')
+    # pre_train_model = cfgs_meta.get('pre_train_model', None)
 
     # -- WORLD MODEL
     cfgs_wm = args.get('world_model')
@@ -110,10 +104,9 @@ def main(args, resume_preempt=False):
     # -- AGENT
     cfgs_agent = args.get('agent')
     feat_len = cfgs_agent["feat_len"]
-    feat_dim = cfgs_agent["feat_dim"]
-    num_layers = cfgs_agent["num_layers"]
-    hidden_dim = cfgs_agent["hidden_dim"]
-    action_dim = cfgs_agent["action_dim"]
+    pooler_params = cfgs_agent["pooler_params"]
+    actor_params = cfgs_agent["actor_params"]
+    critic_params = cfgs_agent["critic_params"]
     gamma = cfgs_agent["gamma"]
     lambd = cfgs_agent["lambd"]
     entropy_coef = cfgs_agent["entropy_coef"]
@@ -156,50 +149,6 @@ def main(args, resume_preempt=False):
     world_model_interval = update_setting["world_model_interval"]
     agent_interval = update_setting["agent_interval"]
 
-    # # -- DATA
-    # cfgs_data = args.get('data')
-    # dataset_type = cfgs_data.get('dataset_type', 'videodataset')
-    # mask_type = cfgs_data.get('mask_type', 'multiblock3d')
-    # dataset_paths = cfgs_data.get('datasets', [])
-    # datasets_weights = cfgs_data.get('datasets_weights', None)
-    # if datasets_weights is not None:
-    #     assert len(datasets_weights) == len(dataset_paths), 'Must have one sampling weight specified for each dataset'
-    # batch_size = cfgs_data.get('batch_size')
-    # num_clips = cfgs_data.get('num_clips')
-    # num_frames = cfgs_data.get('num_frames')
-    # tubelet_size = cfgs_data.get('tubelet_size')
-    # sampling_rate = cfgs_data.get('sampling_rate')
-    # duration = cfgs_data.get('clip_duration', None)
-    # crop_size = cfgs_data.get('crop_size', 224)
-    # patch_size = cfgs_data.get('patch_size')
-    # pin_mem = cfgs_data.get('pin_mem', False)
-    # num_workers = cfgs_data.get('num_workers', 1)
-    # filter_short_videos = cfgs_data.get('filter_short_videos', False)
-    # decode_one_clip = cfgs_data.get('decode_one_clip', True)
-    # log_resource_util_data = cfgs_data.get('log_resource_utilization', False)
-
-    # # -- LOSS
-    # cfgs_loss = args.get('loss')
-    # loss_exp = cfgs_loss.get('loss_exp')
-    # reg_coeff = cfgs_loss.get('reg_coeff')
-    # quant_coeff = cfgs_loss.get('quant_coeff')
-
-    # # -- OPTIMIZATION
-    # cfgs_opt = args.get('optimization')
-    # ipe = cfgs_opt.get('ipe', None)
-    # ipe_scale = cfgs_opt.get('ipe_scale', 1.0)
-    # clip_grad = cfgs_opt.get('clip_grad', None)
-    # wd = float(cfgs_opt.get('weight_decay'))
-    # final_wd = float(cfgs_opt.get('final_weight_decay'))
-    # num_epochs = cfgs_opt.get('epochs')
-    # warmup = cfgs_opt.get('warmup')
-    # start_lr = cfgs_opt.get('start_lr')
-    # lr = cfgs_opt.get('lr')
-    # final_lr = cfgs_opt.get('final_lr')
-    # ema = cfgs_opt.get('ema')
-    # betas = cfgs_opt.get('betas', (0.9, 0.999))
-    # eps = cfgs_opt.get('eps', 1.e-8)
-
     # -- LOGGING
     cfgs_logging = args.get('logging')
     folder = cfgs_logging.get('folder')
@@ -228,7 +177,7 @@ def main(args, resume_preempt=False):
         torch.cuda.set_device(device)
 
     # -- log/checkpointing paths
-    log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
+    # log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
     latest_file = f'{tag}-latest.pth.tar'
     latest_path = os.path.join(folder, latest_file)
     load_path = None
@@ -283,7 +232,7 @@ def main(args, resume_preempt=False):
         store_on_gpu=store_on_gpu,
     )
 
-    if export_data_path:
+    if demon_enable and export_data_path:
         replay_buffer.load_trajectory(
             path=export_data_path
         )
@@ -310,14 +259,19 @@ def main(args, resume_preempt=False):
 
     # -- init Agent
     agent = init_agent(
-        feat_len=feat_len, 
-        feat_dim=feat_dim, 
-        num_layers=num_layers,
-        hidden_dim=hidden_dim, 
-        action_dim=action_dim, 
-        gamma=gamma, 
-        lambd=lambd, 
-        entropy_coef=entropy_coef
+        device=device,
+        pooler_params=pooler_params,
+        actor_params=actor_params,
+        critic_params=critic_params,
+        optimizer_params=optimizer_params,
+        input_dim=world_model.video_feature_dim,
+        feat_len=feat_len,
+        action_dim=action_dims, 
+        gamma=gamma, lambd=lambd, 
+        entropy_coef=entropy_coef,
+        tensorlogger=tb_logger,
+        use_amp=mixed_precision,
+        amp_dtype=dtype
     )
 
     # -- load training checkpoint
@@ -486,6 +440,8 @@ def main(args, resume_preempt=False):
             entropy_loss = agent_debug_data["loss"]["entropy"]
 
             optim_stats = agent_debug_data["optim_stats"]
+            new_lr = agent_debug_data["lr"]
+            new_wd = agent_debug_data["wd"]
 
             agent_total_loss_meter.update(total_loss)
             agent_policy_loss_meter.update(policy_loss)
@@ -498,6 +454,7 @@ def main(args, resume_preempt=False):
                     f"(world_model_train_step)[{total_steps}] "
                     f"loss: {agent_total_loss_meter.avg:.3f} | "
                     f"policy:{agent_policy_loss_meter.avg:.3f} value:{agent_value_loss_meter.avg:.3f} entropy:{agent_entropy_loss_meter.avg:.3f} | "
+                    f"[wd: {new_wd:.2e}] [lr: {new_lr:.2e}] "
                     f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
                     f"[gpu_time: {agent_update_gpu_time_meter.avg:.1f} ms]"
                     f"[wall_time: {agent_update_wall_time_meter.avg:.1f} ms]"
@@ -522,7 +479,7 @@ def main(args, resume_preempt=False):
             CheckpointIO.save(
             world=world_model, agent=agent,
             path=latest_path, logger=logger)
-        if save_every_freq > 0 and total_steps % save_every_freq == 0:
+        if save_interval > 0 and total_steps % save_interval == 0:
             save_every_file = f'{tag}-step{total_steps}.pth.tar'
             save_every_path = os.path.join(folder, save_every_file)
             CheckpointIO.save(

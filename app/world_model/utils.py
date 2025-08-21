@@ -25,6 +25,8 @@ from src.models.world_models.state_decoder import RewardsDecoder, TerminationDec
 from src.models.utils.multimask import (
     MultiMaskWrapper, PredictorMultiMaskWrapper, LatentActionEncoderMultiMaskWrapper)
 from torch.nn.parallel import DistributedDataParallel
+from src.models.agents.actor_critic import Actor, Critic
+
 
 # utils
 from src.utils.tensors import trunc_normal_
@@ -36,24 +38,83 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
 def init_agent(
-        feat_len:int, 
-        feat_dim:int, 
-        num_layers:int,
-        hidden_dim:int, 
+        device,
+        pooler_params:dict,
+        actor_params:dict,
+        critic_params:dict,
+        optimizer_params:dict,
+
+        # agent hyperparams
+        input_dim:int,
+        feat_len:int,
         action_dim:list, 
         gamma:float, 
         lambd:float, 
-        entropy_coef:float
+        entropy_coef:float,
+
+        # Logger 
+        tensorlogger:TensorboardLogger,
+
+        # Training params
+        use_amp=False,
+        amp_dtype=torch.float16,
+        **kwargs,
 ):
+
+    pooler = AttentivePooler(
+        num_queries=1,
+        embed_dim=input_dim,
+        num_heads=pooler_params["num_heads"],
+        mlp_ratio=pooler_params["num_heads"],
+        depth=pooler_params["num_heads"],
+        norm_layer=pooler_params["num_heads"],
+        init_std=pooler_params["init_std"],
+        qkv_bias=pooler_params["qkv_bias"],
+        complete_block=pooler_params["complete_block"],
+    ).to(device)
+    actor = Actor(    
+        input_dim=feat_len*input_dim,
+        hidden_dim=actor_params["hidden_dim"],
+        num_layers=actor_params["num_layers"],
+        action_dim=action_dim,
+    ).to(device)
+    critic = Critic(        
+        input_dim=feat_len*input_dim,
+        hidden_dim=critic_params["hidden_dim"],
+        num_layers=critic_params["num_layers"],
+        output_bins=critic_params["output_bins"],
+    ).to(device)
+    opt_models = [pooler, actor, critic]
+
+    optimizer, scaler, lr_scheduler, wd_scheduler = init_opt(
+        models=opt_models,
+        start_lr=optimizer_params["start_lr"],
+        ref_lr=optimizer_params["ref_lr"],
+        warmup_ratio=optimizer_params["warmup_ratio"],
+        wd=optimizer_params["wd"],
+        final_wd=optimizer_params["final_wd"],
+        final_lr=optimizer_params["final_lr"],
+        mixed_precision=optimizer_params["mixed_precision"],
+        total_steps=optimizer_params["total_steps"],
+        betas=optimizer_params["betas"],
+        eps=optimizer_params["eps"],
+        zero_init_bias_wd=optimizer_params["zero_init_bias_wd"],
+    )
+
     return ActorCriticAgent(
-        feat_len=feat_len, 
-        feat_dim=feat_dim, 
-        num_layers=num_layers,
-        hidden_dim=hidden_dim, 
-        action_dim=action_dim, 
-        gamma=gamma, 
-        lambd=lambd, 
-        entropy_coef=entropy_coef
+        actor=actor,
+        critic=critic,
+        pooler=pooler,
+        optimizer=optimizer, 
+        lr_scheduler=lr_scheduler, 
+        wd_scheduler=wd_scheduler,
+        scaler=scaler, 
+        tb_logger=tensorlogger,
+        feat_len=feat_len,
+        gamma=gamma, lambd=lambd, entropy_coef=entropy_coef,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        clip_grad=100.0,
     )
 
 def init_replay_buffer(

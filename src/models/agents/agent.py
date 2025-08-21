@@ -6,7 +6,7 @@ from typing import List
 from torch.optim import Optimizer
 from src.utils.logging import TensorboardLogger
 from src.utils.logging import get_logger, grad_logger, adamw_logger
-
+from src.utils.schedulers import WarmupCosineSchedule, CosineWDSchedule
 from src.models.attentive_pooler import AttentivePooler
 from src.models.utils.losses import SymLogTwoHotLoss, EMAScalar
 from src.models.agents.multidiscrete_actor import MultiCategoricalActor
@@ -67,6 +67,8 @@ class ActorCriticAgent():
                 # Optimizer
                  optimizer:Optimizer, 
                  scaler:torch.amp.GradScaler, 
+                 lr_scheduler:WarmupCosineSchedule, 
+                 wd_scheduler:CosineWDSchedule,
 
                 # Debug
                  tb_logger:TensorboardLogger | None,
@@ -76,7 +78,6 @@ class ActorCriticAgent():
                  gamma:float, lambd:float, entropy_coef:float,
                  use_amp:bool,
                  amp_dtype:torch.dtype,
-                 warmup:int|None=None,
                  clip_grad:float=10.0,
             ) -> None:
         super().__init__()
@@ -95,7 +96,7 @@ class ActorCriticAgent():
         self.gamma = gamma
         self.lambd = lambd
         self.entropy_coef = entropy_coef
-        self._warmup = warmup
+        self._warmup = warmup if warmup is not None else self._lr_scheduler.warmup_steps
         self._clip_grad = clip_grad
 
         # >> EMA scalars 
@@ -106,10 +107,10 @@ class ActorCriticAgent():
         self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
 
         # >> Optimization 
-        # self._optimizer = torch.optim.Adam(self.parameters(), lr=3e-5, eps=1e-5)
-        # self._scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         self._optimizer = optimizer
         self._scaler = scaler
+        self._lr_scheduler = lr_scheduler
+        self._wd_scheduler = wd_scheduler
 
         # >> Debug setting
         self._tb_logger = tb_logger
@@ -172,6 +173,10 @@ class ActorCriticAgent():
     
     def update(self, feature:StateFeature, action, old_logprob, old_value, reward, termination, clip_len, logger=None):
         self.train()
+        # step LR and WD schedulers
+        _new_lr = self._lr_scheduler.step()
+        _new_wd = self._wd_scheduler.step()
+        
         with torch.amp.autocast(device_type=feature.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
             latent = feature.as_time_patchs()
             latent = pool_sliding_window(latent, self.feat_len) 
@@ -251,4 +256,6 @@ class ActorCriticAgent():
                 "critic":grad_stats_critic,
             },
             "optim_state": optim_stats,
+            "lr":_new_lr,
+            "wd":_new_wd,
         }

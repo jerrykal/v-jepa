@@ -91,6 +91,8 @@ class WorldModel():
         self._reward_loss_fn = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self._termin_loss_fn = nn.BCEWithLogitsLoss()
         
+        self.video_feature_dim = self._context_encoder.backbone.embed_dim
+
     # Interactive function 
     def step(self):
         pass
