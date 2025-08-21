@@ -1,15 +1,16 @@
 import torch
 import torch.nn as nn
 
+from typing import List
 from einops import rearrange
 from torch.optim import Optimizer
 from src.utils.logging import TensorboardLogger
 from src.utils.logging import get_logger, grad_logger, adamw_logger
 from src.utils.schedulers import WarmupCosineSchedule, CosineWDSchedule
 from src.models.utils.losses import SymLogTwoHotLoss, MSELoss
-
+from src.models.utils.jepa_feature import StateFeature
     
-# Modles
+# Models
 from src.models.attentive_pooler import AttentivePooler
 from src.models.utils.multimask import (
     MultiMaskWrapper, PredictorMultiMaskWrapper, LatentActionEncoderMultiMaskWrapper)
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 
 class WorldModel():
     '''
-    The class is organize the each modules on trianing loop 
+    The class is organize the each modules on training loop 
     '''
     def __init__(self,
                  # Models
@@ -36,14 +37,14 @@ class WorldModel():
                  
                  # Optimizer
                  optimizer:Optimizer, 
-                 scaler, 
+                 scaler:torch.amp.GradScaler, 
                  lr_scheduler:WarmupCosineSchedule, 
                  wd_scheduler:CosineWDSchedule,
 
                  # Debug
                  tb_logger:TensorboardLogger | None,
 
-                 # training setting
+                 # Training setting
                  use_amp:bool,
                  amp_dtype:torch.dtype,
                  warmup:int|None=None,
@@ -54,12 +55,17 @@ class WorldModel():
         self._context_encoder = context_encoder
         self._target_encoder = target_encoder
         self._predictor = predictor
-        self._latent_act_encder = latent_action_encoder
+        self._latent_act_encoder = latent_action_encoder
         self._state_pooler = state_pooler
         self._rewards_decoder = rewards_decoder
         self._termin_decoder = termination_decoder
         self._action_projector = action_projector
-        
+        self.modules: List[nn.Module] = [
+            self._context_encoder, self._target_encoder, 
+            self._predictor, self._latent_act_encoder,
+            self._state_pooler, self._rewards_decoder, self._termin_decoder,
+            self._action_projector
+            ]
         # >> Optimizer setting
         self._optimizer = optimizer
         self._scaler = scaler
@@ -73,7 +79,7 @@ class WorldModel():
         self.tubelet_size = self._context_encoder.backbone.tubelet_size
         self.patch_size = self._context_encoder.backbone.patch_size
 
-        # training setting
+        # >> training setting
         self._use_amp = use_amp
         self._amp_dtype = amp_dtype
         self._step = 0
@@ -85,23 +91,34 @@ class WorldModel():
         self._reward_loss_fn = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self._termin_loss_fn = nn.BCEWithLogitsLoss()
         
-
+    # Interactive function 
     def step(self):
         pass
     
-    def reset(self):
+    def reset(self, sample_obs:torch.Tensor, sample_action:torch.Tensor, buffer_size):
         pass
 
-    def encode(self):
+    def export(self):
         pass
 
-    def train(self,
+    def encode(self, sample_obs:torch.Tensor):
+        pass
+    
+    def train(self):
+        for m in self.modules:
+            m.train()
+            
+    def eval(self):
+        for m in self.modules:
+            m.eval()
+    
+    def update(self,
               sample_obs:torch.Tensor, sample_action:torch.Tensor,
               sample_rewards:torch.Tensor, sample_termin:torch.Tensor,
               ):
         '''
         Pseudo code:
-        B: bastch size
+        B: batch size
         
         T: frame-level times
         H: frame-level height
@@ -121,7 +138,7 @@ class WorldModel():
         context latent = self._context_encoder(context obs)
         target latent = self._target_encoder(target obs)
 
-        act = self._latent_act_encder(target latent)
+        act = self._latent_act_encoder(target latent)
         predicted latent =  self.predictor(z, h, masks_enc, masks_pred, act) #[B P D]
 
         hat_rewards = self._rewards_decoder(predicted latent)
@@ -142,6 +159,9 @@ class WorldModel():
 
         return debug log
         '''
+        self.train()
+        _new_lr = self._lr_scheduler.step()
+        _new_wd = self._wd_scheduler.step()
         B, C, T, H, W = sample_obs.shape
         t = T // self.tubelet_size
         p = (H // self.patch_size) * (W // self.patch_size)
@@ -161,7 +181,7 @@ class WorldModel():
             x = [rearrange(_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size)) for _z in target_z] \
                 if isinstance(target_z, list) else \
                 rearrange(target_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size))
-            moduls = self._latent_act_encder.backbone
+            moduls = self._latent_act_encoder.backbone
 
             for block in moduls.enc_layer:
                 x = block(x)  # [B, T, P, D]
@@ -190,7 +210,7 @@ class WorldModel():
             return self._termin_decoder(self._state_pooler, x)
         
         # loss
-        def aciton_loss_fn(real_act_embed, pseudo_act):
+        def action_loss_fn(real_act_embed, pseudo_act):
             return self._action_loss_fn(real_act_embed, pseudo_act)
     
         def reward_loss_fn(hat_reward ,reward):
@@ -211,8 +231,8 @@ class WorldModel():
             _, proj_quant_vec       = forward_action_project(sample_action[:,-1,:])
 
             # L2 loss for hat action min distance with quantize vector 
-            target_quant_vec = self._latent_act_encder.backbone.quant.codebook(quant_idx)
-            loss_action = aciton_loss_fn(proj_quant_vec, target_quant_vec)
+            target_quant_vec = self._latent_act_encoder.backbone.quant.codebook(quant_idx)
+            loss_action = action_loss_fn(proj_quant_vec, target_quant_vec)
             loss_reward = reward_loss_fn(hat_rewards, sample_rewards[:,-1])
             loss_termin = termin_loss_fn(hat_termins, sample_termin[:,-1])
 
@@ -247,12 +267,26 @@ class WorldModel():
         self._step +=1
         optim_stats = adamw_logger(self._optimizer)
 
+        if self._tb_logger is not None:
+            self._tb_logger.log("WorldModel/action_loss", loss_action.item())
+            self._tb_logger.log("WorldModel/reward_loss", loss_reward.item())
+            self._tb_logger.log("WorldModel/termination_loss", loss_termin.item())
+            self._tb_logger.log("WorldModel/total_loss", loss.item())
+           
         return {
+            "loss":{
+                "total":loss.item(),
+                "action":loss_action.item(),
+                "reward":loss_reward.item(),
+                "termin":loss_termin.item()
+            },
             "train_model_state":{
                 "reward_decoder":grad_stats_reward,
                 "termin_decoder":grad_stats_termin,
                 "action_projector":grad_stats_action,
             },
-            "optim_state": optim_stats
+            "optim_state": optim_stats,
+            "lr":_new_lr,
+            "wd":_new_wd,
         }
 

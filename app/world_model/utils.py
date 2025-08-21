@@ -35,9 +35,25 @@ from src.utils.schedulers import WarmupCosineSchedule, CosineWDSchedule
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
-def init_agent():
+def init_agent(
+        feat_len:int, 
+        feat_dim:int, 
+        num_layers:int,
+        hidden_dim:int, 
+        action_dim:list, 
+        gamma:float, 
+        lambd:float, 
+        entropy_coef:float
+):
     return ActorCriticAgent(
-
+        feat_len=feat_len, 
+        feat_dim=feat_dim, 
+        num_layers=num_layers,
+        hidden_dim=hidden_dim, 
+        action_dim=action_dim, 
+        gamma=gamma, 
+        lambd=lambd, 
+        entropy_coef=entropy_coef
     )
 
 def init_replay_buffer(
