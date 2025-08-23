@@ -125,6 +125,7 @@ def init_models(
     tubelet_size: int = 2,
     model_name: str = "vit_base",
     crop_size: int = 224,
+    sample_size: int = 224,
     uniform_power: bool = False,
     use_sdpa: bool = False,
     in_channels: int = 3,
@@ -160,7 +161,7 @@ def init_models(
 
     # Diffusion decoder and noise scheduler
     unet, noise_scheduler = get_unet_and_scheduler(
-        sample_size=crop_size,
+        sample_size=sample_size,
         in_channels=in_channels,
         out_channels=out_channels,
         layers_per_block=layers_per_block,

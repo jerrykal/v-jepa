@@ -92,6 +92,7 @@ def main(args, resume_preempt=False):
 
     # -- DIFFUSION
     cfgs_diffusion = args.get("diffusion")
+    sample_size = cfgs_diffusion.get("sample_size", 224)
     in_channels = cfgs_diffusion.get("in_channels", 3)
     out_channels = cfgs_diffusion.get("out_channels", 3)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
@@ -223,7 +224,10 @@ def main(args, resume_preempt=False):
         num_frames=num_frames,
         tubelet_size=tubelet_size,
         model_name=model_name,
+        # NOTE: crop_size are the size of the input to the encoder,
+        #       sample_size are the size of the input to the decoder.
         crop_size=crop_size,
+        sample_size=sample_size,
         use_sdpa=use_sdpa,
         in_channels=in_channels,
         out_channels=out_channels,
@@ -407,6 +411,10 @@ def main(args, resume_preempt=False):
 
                     clean_images = clips.clone()
                     clean_images = rearrange(clean_images, "b c f h w -> (b f) c h w")
+                    if crop_size != sample_size:
+                        clean_images = F.interpolate(
+                            clean_images, size=sample_size, mode="bilinear"
+                        )
 
                     # Sample noise that we'll add to the images
                     noise = torch.randn_like(clean_images, dtype=dtype, device=device)

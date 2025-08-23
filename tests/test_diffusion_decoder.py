@@ -92,6 +92,7 @@ def main() -> None:
 
     # -- DIFFUSION
     cfgs_diffusion = configs.get("diffusion")
+    sample_size = cfgs_diffusion.get("sample_size", 224)
     in_channels = cfgs_diffusion.get("in_channels", 3)
     out_channels = cfgs_diffusion.get("out_channels", 3)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
@@ -200,6 +201,7 @@ def main() -> None:
         tubelet_size=tubelet_size,
         model_name=model_name,
         crop_size=crop_size,
+        sample_size=sample_size,
         use_sdpa=use_sdpa,
         in_channels=in_channels,
         out_channels=out_channels,
@@ -261,8 +263,12 @@ def main() -> None:
                 generator=torch.Generator(device=device).manual_seed(seed),
             )
 
+        clips = rearrange(clips, "b c f h w -> (b f) c h w")
+        if crop_size != sample_size:
+            clips = F.interpolate(clips, size=sample_size, mode="bilinear")
+
         # Rearrange both clips and reconstructed images to be (C, F, H, W)
-        clips = rearrange(clips, "b c t h w -> c (b t) h w")
+        clips = clips.permute(1, 0, 2, 3)
         reconstructed_images = reconstructed_images.permute(1, 0, 2, 3)
 
         # Unnormalize the clips and reconstructed images for visualization
