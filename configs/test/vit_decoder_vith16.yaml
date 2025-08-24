@@ -16,10 +16,10 @@ data:
   clip_duration: null
 
 logging:
-  folder: logs/test/vit_decoder_vith16_overfit_eval_set
+  folder: logs/test/vit_decoder_vith16
 
 meta:
-  read_checkpoint: logs/train/vit_decoder_vith16_overfit/vit_decoder-latest.pth.tar
+  read_checkpoint: logs/train/vit_decoder_vith16/vit_decoder-latest.pth.tar
   seed: 234
   use_sdpa: true
   dtype: bfloat16
