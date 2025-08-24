@@ -139,13 +139,13 @@ for name, value in debug_result["train_model_state"].items():
                 value.max,
                 value.global_norm))
     
-optim_state = debug_result["optim_state"]
+optim_stats = debug_result["optim_stats"]
 print("[%s]first moment: %.2e [%.2e %.2e] second moment: %.2e [%.2e %.2e]"                      
-        % ("optim_state",
-            optim_state.get('exp_avg').avg,
-            optim_state.get('exp_avg').min,
-            optim_state.get('exp_avg').max,
-            optim_state.get('exp_avg_sq').avg,
-            optim_state.get('exp_avg_sq').min,
-            optim_state.get('exp_avg_sq').max))
+        % ("optim_stats",
+            optim_stats.get('exp_avg').avg,
+            optim_stats.get('exp_avg').min,
+            optim_stats.get('exp_avg').max,
+            optim_stats.get('exp_avg_sq').avg,
+            optim_stats.get('exp_avg_sq').min,
+            optim_stats.get('exp_avg_sq').max))
                             

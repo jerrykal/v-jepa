@@ -90,8 +90,8 @@ class WorldModel():
         self._tb_logger = tb_logger
         
         # >> Process setting
-        self.tubelet_size = self._context_encoder.backbone.tubelet_size # TODO
-        self.patch_size = self._context_encoder.backbone.patch_size # TODO
+        self.tubelet_size = self._context_encoder.backbone.module.tubelet_size # TODO
+        self.patch_size = self._context_encoder.backbone.module.patch_size # TODO
 
         # >> Training setting
         self._use_amp = use_amp
@@ -233,7 +233,7 @@ class WorldModel():
             x = [rearrange(_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size)) for _z in target_z] \
                 if isinstance(target_z, list) else \
                 rearrange(target_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size))
-            moduls = self._latent_act_encoder.backbone # TODO
+            moduls = self._latent_act_encoder.module.backbone # TODO: DDP module. need drop
 
             # pass through temporal encoder blocks
             for block in moduls.enc_layer:
@@ -351,7 +351,7 @@ class WorldModel():
                 "termin_decoder":grad_stats_termin,
                 "action_projector":grad_stats_action,
             },
-            "optim_state": optim_stats,
+            "optim_stats": optim_stats,
             "lr":_new_lr,
             "wd":_new_wd,
         }

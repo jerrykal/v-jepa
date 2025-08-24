@@ -255,7 +255,7 @@ class ActorCriticAgent():
                 "actor":grad_stats_actor,
                 "critic":grad_stats_critic,
             },
-            "optim_state": optim_stats,
+            "optim_stats": optim_stats,
             "lr":_new_lr,
             "wd":_new_wd,
         }
