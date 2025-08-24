@@ -225,15 +225,15 @@ def init_world_model(
         depth=action_projector_params["depth"], 
         quant=latent_action_enc.backbone.quant, 
     )
-    if not device == "cpu":
-        action_projector = DistributedDataParallel(action_projector)
-        state_pooler = DistributedDataParallel(state_pooler)
-        reward_decoder = DistributedDataParallel(reward_decoder)
-        termin_decoder = DistributedDataParallel(termin_decoder)
-        encoder = DistributedDataParallel(encoder)
-        target_encoder = DistributedDataParallel(target_encoder)
-        predictor = DistributedDataParallel(predictor)
-        latent_action_enc = DistributedDataParallel(latent_action_enc)
+    # if not device == "cpu":
+    #     action_projector = DistributedDataParallel(action_projector)
+    #     state_pooler = DistributedDataParallel(state_pooler)
+    #     reward_decoder = DistributedDataParallel(reward_decoder)
+    #     termin_decoder = DistributedDataParallel(termin_decoder)
+    #     encoder = DistributedDataParallel(encoder)
+    #     target_encoder = DistributedDataParallel(target_encoder)
+    #     predictor = DistributedDataParallel(predictor)
+    #     latent_action_enc = DistributedDataParallel(latent_action_enc)
 
     if pretrained_model_path is not None:
         (

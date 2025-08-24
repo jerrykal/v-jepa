@@ -277,7 +277,7 @@ class VectorQuantization(IQuantization):
         inputs: Tensor,
     ) -> tuple[tuple[Tensor, Tensor], Tensor | None]:
         # Project the inputs to the codebook space
-        encoded = self.encode(inputs)
+        encoded = self.in_proj(inputs)
         quantized, idxs = self.quantize(encoded)
         outputs = self.out_proj(quantized)
 
@@ -286,8 +286,8 @@ class VectorQuantization(IQuantization):
             return (outputs, idxs), None
 
         # Vector quantization loss
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
+        e_latent_loss = F.mse_loss(quantized.detach(), encoded)
+        q_latent_loss = F.mse_loss(quantized, encoded.detach())
         loss = q_latent_loss + self._commitment_cost * e_latent_loss
 
         return (outputs, idxs), loss

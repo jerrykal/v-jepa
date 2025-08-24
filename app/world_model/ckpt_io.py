@@ -49,15 +49,16 @@ class CheckpointIO:
         ctx_enc = _unwrap_ddp(world._context_encoder)
         tgt_enc = _unwrap_ddp(world._target_encoder)
         predictor = _unwrap_ddp(world._predictor)
-        lae = _unwrap_ddp(world._latent_act_encder)
+        lae = _unwrap_ddp(world._latent_act_encoder)
         pooler = _unwrap_ddp(world._state_pooler)
         rew_dec = _unwrap_ddp(world._rewards_decoder)
         ter_dec = _unwrap_ddp(world._termin_decoder)
         act_proj = _unwrap_ddp(world._action_projector)
 
-        ac_actor = _unwrap_ddp(agent.actor)
-        ac_critic = _unwrap_ddp(agent.critic)
-        ac_slow_critic = _unwrap_ddp(agent.slow_critic)
+        ac_pooler = _unwrap_ddp(agent._pooler)
+        ac_actor = _unwrap_ddp(agent._actor)
+        ac_critic = _unwrap_ddp(agent._critic)
+        ac_slow_critic = _unwrap_ddp(agent._slow_critic)
 
         ckpt: Dict[str, Any] = {
             "version": 1,
@@ -99,6 +100,7 @@ class CheckpointIO:
             # ---- Actor-Critic Agent ----
             "agent": {
                 "model": {
+                    "pooler": ac_pooler.state_dict(),
                     "actor": ac_actor.state_dict(),
                     "critic": ac_critic.state_dict(),
                     "slow_critic": ac_slow_critic.state_dict(),
@@ -164,15 +166,16 @@ class CheckpointIO:
         ctx_enc = _unwrap_ddp(world._context_encoder)
         tgt_enc = _unwrap_ddp(world._target_encoder)
         predictor = _unwrap_ddp(world._predictor)
-        lae = _unwrap_ddp(world._latent_act_encder)
+        lae = _unwrap_ddp(world._latent_act_encoder)
         pooler = _unwrap_ddp(world._state_pooler)
         rew_dec = _unwrap_ddp(world._rewards_decoder)
         ter_dec = _unwrap_ddp(world._termin_decoder)
         act_proj = _unwrap_ddp(world._action_projector)
 
-        ac_actor = _unwrap_ddp(agent.actor)
-        ac_critic = _unwrap_ddp(agent.critic)
-        ac_slow_critic = _unwrap_ddp(agent.slow_critic)
+        ac_pooler = _unwrap_ddp(agent._pooler)
+        ac_actor = _unwrap_ddp(agent._actor)
+        ac_critic = _unwrap_ddp(agent._critic)
+        ac_slow_critic = _unwrap_ddp(agent._slow_critic)
 
         # ---- load world model ----
         wm = ckpt.get("world_model", {})
@@ -216,6 +219,8 @@ class CheckpointIO:
         ag = ckpt.get("agent", {})
         ag_model = ag.get("model", {})
         if ag_model:
+            if ag_model.get("pooler") is not None:
+                ac_pooler.load_state_dict(ag_model["pooler"], strict=True)
             if ag_model.get("actor") is not None:
                 ac_actor.load_state_dict(ag_model["actor"], strict=True)
             if ag_model.get("critic") is not None:

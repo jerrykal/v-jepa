@@ -39,7 +39,7 @@ state_decoder_params = {
     "pooler_num_heads": 4,        # Number of attention heads in pooling
     "mlp_ratio": 4.0,             # MLP hidden size multiplier
     "pooler_depth": 2,            # Number of transformer blocks in pooler
-    "norm_layer": nn.LayerNorm,    # Normalization type ("LayerNorm", "BatchNorm", etc.)
+    "norm_layer": "LayerNorm",    # Normalization type ("LayerNorm", "BatchNorm", etc.)
     "init_std": 0.02,              # Weight initialization standard deviation
     "qkv_bias": True,             # Whether to use bias in QKV projections
     "complete_block": False,      # Whether to use a complete transformer block
@@ -110,21 +110,22 @@ replay_buffer = init_replay_buffer(
 replay_buffer.load_buffer("/home/cgv/Documents/project/EmbodiedAgent/v-jepa/test_1024.npz")
 
 wm = init_world_model(
-    device="cpu",
+    device="cuda",
     video_model_params=video_model_params,
     latent_action_enc_params=latent_action_enc_params,
     state_decoder_params=state_decoder_params,
     action_projector_params=action_projector_params,
     optimizer_params=optimizer_params,
     tensorlogger=tensor_logger,
+    action_dims=action_dims,
     pretrained_model_path=pretrained_model_path,
     fine_tune=fine_tune,
     use_amp=False,
     amp_dtype=torch.float16
 )
 
-obs, action, reward, termination  = replay_buffer.sample(batch_size=16, external_batch_size=0, batch_length=16, to_device="cpu")
-debug_result = wm.train(
+obs, action, reward, termination  = replay_buffer.sample(batch_size=16, external_batch_size=0, batch_length=16, to_device="cuda")
+debug_result = wm.update(
     sample_obs=obs, sample_action=action,
     sample_rewards=reward, sample_termin=termination,
 )

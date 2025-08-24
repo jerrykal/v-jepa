@@ -26,7 +26,7 @@ def pool_sliding_window(
     """
     B, T_full, P, D = latent.shape
     num_clips = T_full - clip_len + 1
-    assert num_clips > 0, "clip_len too long, can't do sliding window"
+    assert num_clips > 0, f"clip_len too long, can't do sliding window, T_full:{T_full}, clip_len:{clip_len}, num_clips:{num_clips}"
 
     latent = rearrange(latent,"B T P D -> (B T) P D")
     latent = pooler(latent).squeeze(1)
@@ -158,7 +158,7 @@ class ActorCriticAgent():
         self.eval()
         with torch.amp.autocast(device_type=feature.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
             latent = feature.as_time_patches() # [B T P D]
-            latent = pool_sliding_window(latent, self.feat_len)[:,-1,:,:]
+            latent = pool_sliding_window(self._pooler, latent, self.feat_len)[:,-1,:]
             logits = self.policy(latent)
             dist = self.dist_fn(logits)
             if greedy:
@@ -179,7 +179,7 @@ class ActorCriticAgent():
         
         with torch.amp.autocast(device_type=feature.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
             latent = feature.as_time_patches()
-            latent = pool_sliding_window(latent, self.feat_len) 
+            latent = pool_sliding_window(self._pooler, latent, self.feat_len) 
             logits, raw_value = self.get_logits_raw_value(latent)
             dist = self.dist_fn(logits[:, :-1,:])
             log_prob = dist.log_prob(action)

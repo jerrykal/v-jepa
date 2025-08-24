@@ -68,6 +68,10 @@ class WorldModel():
         self._rewards_decoder = rewards_decoder
         self._termin_decoder = termination_decoder
         self._action_projector = action_projector
+        self.train_modules: List[nn.Module] = [
+            self._state_pooler, self._rewards_decoder, self._termin_decoder,
+            self._action_projector
+            ]
         self.modules: List[nn.Module] = [
             self._context_encoder, self._target_encoder, 
             self._predictor, self._latent_act_encoder,
@@ -86,8 +90,8 @@ class WorldModel():
         self._tb_logger = tb_logger
         
         # >> Process setting
-        self.tubelet_size = self._context_encoder.module.backbone.tubelet_size
-        self.patch_size = self._context_encoder.module.backbone.patch_size
+        self.tubelet_size = self._context_encoder.backbone.tubelet_size # TODO
+        self.patch_size = self._context_encoder.backbone.patch_size # TODO
 
         # >> Training setting
         self._use_amp = use_amp
@@ -98,7 +102,7 @@ class WorldModel():
         self._num_last_frames = -3
 
         self._action_loss_fn = MSELoss()
-        self._reward_loss_fn = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
+        self._reward_loss_fn = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20).cuda()
         self._termin_loss_fn = nn.BCEWithLogitsLoss()
 
         # >> Variables
@@ -110,7 +114,7 @@ class WorldModel():
         self._p = 0
 
         # Public: 
-        self.video_feature_dim = self._context_encoder.module.backbone.embed_dim
+        self.video_feature_dim = self._context_encoder.backbone.embed_dim #TODO
         self.imagination_batch_size = -1
         self.imagination_batch_length = -1
         self.latent_buffer = None
@@ -180,13 +184,13 @@ class WorldModel():
                 self.termination_hat_buffer = torch.zeros(scalar_size, dtype=self._amp_dtype, device="cuda")
 
     def encode(self, sample_obs:torch.Tensor):
-        B, T, C, H, W = sample_obs.shape
+        B, C, T, H, W = sample_obs.shape
         t = T // self.tubelet_size
         p = (H // self.patch_size) * (W // self.patch_size)
         return StateFeature(x=self._target_encoder(sample_obs), t=t, p=p)
     
     def train(self):
-        for m in self.modules:
+        for m in self.train_modules:
             m.train()
             
     def eval(self):
@@ -229,7 +233,7 @@ class WorldModel():
             x = [rearrange(_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size)) for _z in target_z] \
                 if isinstance(target_z, list) else \
                 rearrange(target_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size))
-            moduls = self._latent_act_encoder.module.backbone
+            moduls = self._latent_act_encoder.backbone # TODO
 
             # pass through temporal encoder blocks
             for block in moduls.enc_layer:

@@ -19,7 +19,7 @@ class StateFeature:
     - Supports common slicing, padding, concatenation, and device/dtype operations.
     """
 
-    __slots__ = ("_x", "_shape")
+    __slots__ = ("_x", "_tp_shape")
 
     def __init__(self, x: Tensor, t:int, p:int):
         assert x.ndim == 3, f"expected [B,(T*P),D], got {tuple(x.shape)}"

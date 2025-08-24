@@ -289,12 +289,12 @@ def main(args, resume_preempt=False):
         def interactive(_current_obs, _current_info, _sum_reward):
             world_model.eval()
             agent.eval()
-            context_obs.append(rearrange(torch.Tensor(_current_obs.copy()).cuda(), "C H W -> 1 1 C H W")/255) # [one env , len obs ,(obs) ]
+            context_obs.append(rearrange(torch.Tensor(_current_obs.copy()).cuda(), "C H W -> 1 C 1 H W")/255) # [one env , len obs ,(obs) ]
             with torch.no_grad():
                 if len(context_obs) != num_frames:
                     action = vec_env.action_space.sample()
                 else:
-                    context_latent = world_model.encode(torch.cat(list(context_obs), dim=1))
+                    context_latent = world_model.encode(torch.cat(list(context_obs), dim=2))
                     action = agent.sample_as_env_action(
                         context_latent, greedy=False
                     )

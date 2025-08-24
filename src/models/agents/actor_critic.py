@@ -80,8 +80,7 @@ class Actor(nn.Module):
         """
         Forward pass for 2D input [B, F].
         """
-        h = self.preprocess(x2d)   # [B, H]
-        logits = self.core(h)      # Action logits
+        logits = self.core(x2d)      # Action logits
         return logits
 
     def forward(self, x: torch.Tensor):

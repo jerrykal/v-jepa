@@ -129,8 +129,8 @@ class TensorboardLogger():
         self._tag_step[tag] = 0 if tag not in self._tag_step else self._tag_step[tag] + 1
         return self._tag_step[tag]
 
-    def log(self, tag, value, type='scalar', step=None, **kwargs):
-        _step = self._log_count(tag, step)
+    def log(self, tag, value, type='scalar', **kwargs):
+        _step = self._log_count(tag)
         _tag = f"{type}/{tag}"
         if type == 'scalar':
             self._writer.add_scalar(_tag, value, _step)
