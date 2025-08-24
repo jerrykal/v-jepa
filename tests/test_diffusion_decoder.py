@@ -74,7 +74,6 @@ def main() -> None:
     use_sdpa = cfgs_meta.get("use_sdpa", False)
     which_dtype = cfgs_meta.get("dtype")
     pre_train_model = cfgs_meta.get("pre_train_model")
-    save_dir = cfgs_meta.get("save_dir")
     if which_dtype.lower() == "bfloat16":
         dtype = torch.bfloat16
         mixed_precision = True
@@ -84,6 +83,10 @@ def main() -> None:
     else:
         dtype = torch.float32
         mixed_precision = False
+
+    # -- LOGGING
+    cfgs_logging = configs.get("logging")
+    folder = cfgs_logging.get("folder")
 
     # -- MODEL
     cfgs_model = configs.get("model")
@@ -235,7 +238,7 @@ def main() -> None:
 
     unsupervised_loader = iter(unsupervised_loader)
 
-    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(folder, exist_ok=True)
     for i in tqdm(range(num_samples_to_generate), desc="Generating samples"):
         # Sample one clip from the data-loader
         udata = next(unsupervised_loader)
@@ -283,7 +286,7 @@ def main() -> None:
         )
         save_tensor_as_gif(
             combined_images,
-            os.path.join(save_dir, f"{i:02d}.gif"),
+            os.path.join(folder, f"{i:02d}.gif"),
         )
 
 

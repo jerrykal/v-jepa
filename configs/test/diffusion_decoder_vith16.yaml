@@ -1,7 +1,3 @@
-app: diffusion_decoder
-nodes: 16
-tasks_per_node: 8
-
 data:
   dataset_type: VideoDataset
   datasets:
@@ -19,11 +15,12 @@ data:
   filter_short_videos: false
   clip_duration: null
 
+logging:
+  folder: logs/test/diffusion_decoder_vith16
+
 meta:
-  save_dir: logs/test/diffusion_decoder_vith16
   read_checkpoint: logs/train/diffusion_decoder_vith16/diffusion_decoder-latest.pth.tar
   seed: 234
-  eval_freq: 100
   use_sdpa: true
   dtype: bfloat16
   pre_train_model: weights/vith16.pth.tar
