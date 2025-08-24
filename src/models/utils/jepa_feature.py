@@ -30,22 +30,14 @@ class StateFeature:
 
     # >> Constructors 
     @classmethod
-    def from_flat(cls, x_flat: Tensor, T: int | None = None, P: int | None = None) -> StateFeature:
+    def from_time_patches(cls, x: Tensor) -> StateFeature:
         """
-        Create from a flattened [B, T*P, D] tensor.
-        You must provide either T or P (the other is inferred).
+        Create from a [B, T P, D] tensor.
         """
-        assert x_flat.ndim == 3, f"expected [B,TP,D], got {tuple(x_flat.shape)}"
-        B, TP, D = x_flat.shape
-        if T is None and P is None:
-            raise ValueError("from_flat() requires either T or P")
-        if T is None:
-            assert P and TP % P == 0, "TP must be divisible by P"
-            T = TP // P
-        if P is None:
-            assert T and TP % T == 0, "TP must be divisible by T"
-            P = TP // T
-        return cls(x_flat, t=T, p=P)
+        assert x.ndim == 4, f"expected [B, T, P,D], got {tuple(x.shape)}"
+        B, T, P, D = x.shape
+
+        return cls(x.contiguous().view(B, T*P, D), t=T, p=P)
     
     # >> Views / Accessors
     @property
@@ -66,9 +58,9 @@ class StateFeature:
     @property
     def dtype(self):    return self._x.dtype
 
-    def as_time_patchs(self) -> Tensor:
+    def as_time_patches(self) -> Tensor:
         """Return as [B, T, P, D]."""
-        return self._x.view(self.B, self.T, self.P, self.D)
+        return self._x.contiguous().view(self.B, self.T, self.P, self.D)
 
     def as_flat(self) -> Tensor:
         """Return as [B, T*P, D]."""

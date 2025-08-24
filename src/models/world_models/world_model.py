@@ -20,6 +20,14 @@ from src.models.world_models.action_projector import ActionProjector
 
 logger = get_logger(__name__)
 
+def build_masks(B:int, t:int, p:int, device):
+    mask = torch.ones((t, p), dtype=torch.int32).to(device)
+    mask[-1, :] = 0
+    mask = mask.flatten()
+    mask_p = torch.argwhere(mask == 0).reshape(1, -1).expand(B, -1)
+    mask_e = torch.nonzero(mask).reshape(1, -1).expand(B, -1)
+    return [mask_e], [mask_p]
+
 class WorldModel():
     '''
     The class is organize the each modules on training loop 
@@ -46,10 +54,10 @@ class WorldModel():
 
                  # Training setting
                  use_amp:bool,
+                 action_dims:list,
                  amp_dtype:torch.dtype,
                  warmup:int|None=None,
                  clip_grad:float=10.0,
-
                  ):
         # >> Models setting
         self._context_encoder = context_encoder
@@ -66,6 +74,8 @@ class WorldModel():
             self._state_pooler, self._rewards_decoder, self._termin_decoder,
             self._action_projector
             ]
+        self.action_dims = action_dims
+
         # >> Optimizer setting
         self._optimizer = optimizer
         self._scaler = scaler
@@ -76,10 +86,10 @@ class WorldModel():
         self._tb_logger = tb_logger
         
         # >> Process setting
-        self.tubelet_size = self._context_encoder.backbone.tubelet_size
-        self.patch_size = self._context_encoder.backbone.patch_size
+        self.tubelet_size = self._context_encoder.module.backbone.tubelet_size
+        self.patch_size = self._context_encoder.module.backbone.patch_size
 
-        # >> training setting
+        # >> Training setting
         self._use_amp = use_amp
         self._amp_dtype = amp_dtype
         self._step = 0
@@ -90,21 +100,90 @@ class WorldModel():
         self._action_loss_fn = MSELoss()
         self._reward_loss_fn = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20)
         self._termin_loss_fn = nn.BCEWithLogitsLoss()
-        
-        self.video_feature_dim = self._context_encoder.backbone.embed_dim
+
+        # >> Variables
+        # Private:
+        self._current_latent:torch.Tensor = None
+        self._i = 0
+        self._B = 0
+        self._t = 0
+        self._p = 0
+
+        # Public: 
+        self.video_feature_dim = self._context_encoder.module.backbone.embed_dim
+        self.imagination_batch_size = -1
+        self.imagination_batch_length = -1
+        self.latent_buffer = None
+        self.action_buffer = None
+        self.reward_hat_buffer = None
+        self.termination_hat_buffer = None
 
     # Interactive function 
-    def step(self):
-        pass
-    
-    def reset(self, sample_obs:torch.Tensor, sample_action:torch.Tensor, buffer_size):
-        pass
+    def step(self, action):
+        with torch.no_grad():
+            (act, _), _         = self._action_projector(action)
+            z                   = self._current_latent[:,self._p:] # [B (1:T)*P D]
+            masks_e, masks_p    = build_masks(B=self._B, t=self._t, p=self._p, device=self._current_latent.device)
+            pred_z              = self._predictor(z, None, masks_e, masks_p, act)[0] # list{[B P D]}[0]
+        
+        self.latent_buffer[:,self._i:self._i+2] = self._current_latent[:,-2*self._p:].contiguous().view(self._B, 2, self._p, self.video_feature_dim).cpu() # [B i:i+1 P D]
+        self.action_buffer[:,self._i] = action.cpu()
+        self._current_latent = torch.concat([self._current_latent[:,self._p:], pred_z],dim=1)
+        self.target_latent = torch.concat([self.target_latent[:,self._p:], pred_z],dim=1)
+        self.reward_hat_buffer[:,self._i] = self._rewards_decoder(self._state_pooler, self._current_latent[:,self._num_last_frames*self._p:,]).cpu()
+        self.termination_hat_buffer[:,self._i] = self._termin_decoder(self._state_pooler, self._current_latent[:,self._num_last_frames*self._p:,]).cpu()
+        self._bump_index()
+        return self.target_latent
 
-    def export(self):
-        pass
+    def reset(self, sample_obs:torch.Tensor, imagination_batch_size:int, imagination_batch_length:int):
+        with torch.no_grad():
+            self._init_buffer(imagination_batch_size, imagination_batch_length)
+            B, C, T, H, W = sample_obs.shape
+            self._B = B
+            self._t = T // self.tubelet_size
+            self._p = (H // self.patch_size) * (W // self.patch_size)
+            self._i = 0
+            self._current_latent = self._context_encoder(sample_obs)
+            self.target_latent = self._target_encoder(sample_obs)
+        return StateFeature(x=self.target_latent, t=self._t, p=self._p)
+
+    def export(self, device):
+        export_state = StateFeature.from_time_patches(self.latent_buffer.to(device))
+        export_action = self.action_buffer.to(device)
+        export_rewards = self.reward_hat_buffer.to(device)
+        export_terminations = self.termination_hat_buffer.to(device)
+
+        return export_state, export_action, export_rewards, export_terminations
+    
+    def _bump_index(self):
+        if self.imagination_batch_length <= 0:
+            raise RuntimeError("Buffer length is zero; call reset/_init_buffer first.")
+        self._i = (self._i + 1) % self.imagination_batch_length
+
+    def _init_buffer(self, imagination_batch_size, imagination_batch_length):
+            '''
+                This can slightly improve the efficiency of imagination data But may vary across different machines
+            '''
+            if self.imagination_batch_size != imagination_batch_size or self.imagination_batch_length != imagination_batch_length:
+                print(f"init_imagination_buffer: {imagination_batch_size}x{imagination_batch_length}@{self._amp_dtype}")
+
+                self.imagination_batch_size = imagination_batch_size
+                self.imagination_batch_length = imagination_batch_length
+
+                latent_size = (imagination_batch_size, imagination_batch_length+1 , self._p, self.video_feature_dim) 
+                action_size = (imagination_batch_size, imagination_batch_length   , len(self.action_dims))
+                scalar_size = (imagination_batch_size, imagination_batch_length  )
+
+                self.latent_buffer = torch.zeros(latent_size, dtype=self._amp_dtype, device="cuda") 
+                self.action_buffer = torch.zeros(action_size, dtype=self._amp_dtype, device="cuda")
+                self.reward_hat_buffer = torch.zeros(scalar_size, dtype=self._amp_dtype, device="cuda")
+                self.termination_hat_buffer = torch.zeros(scalar_size, dtype=self._amp_dtype, device="cuda")
 
     def encode(self, sample_obs:torch.Tensor):
-        pass
+        B, T, C, H, W = sample_obs.shape
+        t = T // self.tubelet_size
+        p = (H // self.patch_size) * (W // self.patch_size)
+        return StateFeature(x=self._target_encoder(sample_obs), t=t, p=p)
     
     def train(self):
         for m in self.modules:
@@ -140,15 +219,6 @@ class WorldModel():
         t = T // self.tubelet_size
         p = (H // self.patch_size) * (W // self.patch_size)
 
-         # >> helper: build encoder/predictor masks 
-        def build_masks():
-            mask = torch.ones((t, p), dtype=torch.int32).to(sample_obs.device)
-            mask[-1, :] = 0
-            mask = mask.flatten()
-            mask_p = torch.argwhere(mask == 0).reshape(1, -1).expand(B, -1)
-            mask_e = torch.nonzero(mask).reshape(1, -1).expand(B, -1)
-            return [mask_e], [mask_p]
-        
         # >> helper: run target encoder
         def forward_target(obs):
             z = self._target_encoder(obs)
@@ -159,7 +229,7 @@ class WorldModel():
             x = [rearrange(_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size)) for _z in target_z] \
                 if isinstance(target_z, list) else \
                 rearrange(target_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size))
-            moduls = self._latent_act_encoder.backbone
+            moduls = self._latent_act_encoder.module.backbone
 
             # pass through temporal encoder blocks
             for block in moduls.enc_layer:
@@ -206,7 +276,7 @@ class WorldModel():
         # >> forward pass
         self._optimizer.zero_grad()
         with torch.amp.autocast(device_type=sample_obs.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
-            mask_e, mask_p          = build_masks()
+            mask_e, mask_p          = build_masks(B=B, t=t, p=p, device=sample_obs.device)
             target_z                = forward_target(sample_obs)
             pseudo_act, quant_idx   = forward_latent_action(target_z)
             _, full_z               = forward_prediction(sample_obs, mask_e, mask_p, pseudo_act)

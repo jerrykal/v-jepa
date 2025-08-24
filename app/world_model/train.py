@@ -35,11 +35,8 @@ from einops import rearrange
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed, AllReduce
 from src.utils.logging import (
-    CSVLogger,
     gpu_timer,
     get_logger,
-    grad_logger,
-    adamw_logger,
     AverageMeter,
     TensorboardLogger)
 from torch.nn.parallel import DistributedDataParallel
@@ -113,7 +110,6 @@ def main(args, resume_preempt=False):
 
     # -- ENV
     cfgs_env = args.get('env')
-    env_params = cfgs_env["env_params"]
     frame_skip = cfgs_env["frame_skip"]
     maxpooling = cfgs_env["maxpooling"]
 
@@ -213,13 +209,13 @@ def main(args, resume_preempt=False):
 
     # -- init environment
     vec_env = env_factory.build_single_env(
-        env_params, frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
+        cfgs_env, frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
     action_dims = list(vec_env.action_space.nvec)
     ActionParser.init(action_dims)
 
 
     # -- init replay buffer
-    image_size = env_params["Environment"]["task_parameter"]["image_size"]
+    image_size = cfgs_env["Environment"]["task_parameter"]["image_size"]
     
     replay_buffer = init_replay_buffer(
         device=device,
@@ -251,6 +247,7 @@ def main(args, resume_preempt=False):
         action_projector_params=action_projector_params,
         optimizer_params=optimizer_params,
         tensorlogger=tb_logger,
+        action_dims=action_dims,
         pretrained_model_path=pretrained_model_path,
         fine_tune=fine_tune,
         use_amp=mixed_precision,
@@ -284,14 +281,15 @@ def main(args, resume_preempt=False):
     # context_action = deque(maxlen=num_frames)
     sum_reward = np.zeros(num_envs)
     current_obs, current_info = vec_env.reset()
-    
+
     # -- Training loop
     for total_steps in range(max_steps//num_envs):
         
         # >> training script
-        def interactive():
+        def interactive(_current_obs, _current_info, _sum_reward):
             world_model.eval()
             agent.eval()
+            context_obs.append(rearrange(torch.Tensor(_current_obs.copy()).cuda(), "C H W -> 1 1 C H W")/255) # [one env , len obs ,(obs) ]
             with torch.no_grad():
                 if len(context_obs) != num_frames:
                     action = vec_env.action_space.sample()
@@ -302,13 +300,10 @@ def main(args, resume_preempt=False):
                     )
                     action = np.squeeze(action)
             obs, reward, done, truncated, info = vec_env.step(action)
-            context_obs.append(rearrange(torch.Tensor(current_obs.copy()).cuda(), "C H W -> 1 1 C H W")/255) # [one env , len obs ,(obs) ]
             # context_action.append(action) # STORM like actions buffer
 
-            replay_buffer.append(current_obs, action, reward, done)
-            sum_reward += reward
-            current_obs = obs
-            current_info = info
+            replay_buffer.append(_current_obs, action, reward, done)
+            _sum_reward += reward
 
             truncated = np.array([truncated])
             done = np.array([done])
@@ -316,13 +311,13 @@ def main(args, resume_preempt=False):
             if done_flag.any() :
                 for i in range(num_envs):
                     if done_flag:
-                        tb_logger.log(f"env/reward", sum_reward[i],type='scalar')
-                        tb_logger.log(f"env/episode_steps", current_info["elapsed_steps"]//4,type='scalar')
+                        tb_logger.log(f"env/reward", _sum_reward[i],type='scalar')
+                        tb_logger.log(f"env/episode_steps", info["elapsed_steps"]//4,type='scalar')
                         tb_logger.log("replay_buffer/length", len(replay_buffer),type='scalar')
-                        sum_reward[i] = 0
+                        _sum_reward[i] = 0
                         context_obs.clear()
-                        current_obs, current_info = vec_env.reset()
-            return None
+                        obs, info = vec_env.reset()
+            return obs, info, _sum_reward
 
         def world_model_train_step():
             world_model.train()
@@ -345,7 +340,7 @@ def main(args, resume_preempt=False):
             )
 
             context_latent = world_model.reset(
-                sample_obs=obs, sample_action=action, buffer_size=imagination_seq_length)
+                sample_obs=obs, imagine_batch_size=imagination_batch_size, imagine_batch_length=imagination_seq_length)
             for i in range(imagination_seq_length):
                 action = agent.sample(context_latent)
                 context_latent = world_model.step(action)
@@ -364,7 +359,8 @@ def main(args, resume_preempt=False):
         # >> Training flow
         # >> World model and Agent interactive with Env
         step_start_time = time.time()
-        (interactive_debug_data), interactive_gpu_etime_ms= gpu_timer(interactive)
+        (current_obs, current_info, sum_reward), interactive_gpu_etime_ms= gpu_timer(
+            interactive, True, _current_obs=current_obs, _current_info=current_info, _sum_reward=sum_reward)
         interactive_wall_time_meter.update((time.time() - step_start_time) * 1000.)
         interactive_gpu_time_meter.update(interactive_gpu_etime_ms)
         if (total_steps % log_freq == 0):

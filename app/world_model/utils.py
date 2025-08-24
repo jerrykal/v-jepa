@@ -32,6 +32,7 @@ from src.models.agents.actor_critic import Actor, Critic
 from src.utils.tensors import trunc_normal_
 from src.utils.replay_buffer import ReplayBuffer
 from src.utils.logging import TensorboardLogger
+from src.utils.norm_layer import get_norm_layer
 from src.utils.schedulers import WarmupCosineSchedule, CosineWDSchedule
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
@@ -59,15 +60,15 @@ def init_agent(
         use_amp=False,
         amp_dtype=torch.float16,
         **kwargs,
-):
+)->ActorCriticAgent:
 
     pooler = AttentivePooler(
         num_queries=1,
         embed_dim=input_dim,
         num_heads=pooler_params["num_heads"],
-        mlp_ratio=pooler_params["num_heads"],
-        depth=pooler_params["num_heads"],
-        norm_layer=pooler_params["num_heads"],
+        mlp_ratio=pooler_params["mlp_ratio"],
+        depth=pooler_params["depth"],
+        norm_layer=get_norm_layer(pooler_params["norm_layer"]),
         init_std=pooler_params["init_std"],
         qkv_bias=pooler_params["qkv_bias"],
         complete_block=pooler_params["complete_block"],
@@ -142,12 +143,13 @@ def init_world_model(
         action_projector_params:dict,
         optimizer_params:dict,
         tensorlogger:TensorboardLogger,
+        action_dims:list,
         pretrained_model_path=None,
         fine_tune=False,
         use_amp=False,
         amp_dtype=torch.float16,
         **kwargs,
-    ):
+    )->WorldModel:
     '''
     Initialize all components of the world model, including:
 
@@ -203,7 +205,7 @@ def init_world_model(
         num_heads=state_decoder_params["pooler_num_heads"],
         mlp_ratio=state_decoder_params["mlp_ratio"],
         pooler_depth=state_decoder_params["pooler_depth"],
-        norm_layer=state_decoder_params["norm_layer"],
+        norm_layer=get_norm_layer(state_decoder_params["norm_layer"]),
         init_std=state_decoder_params["init_std"],
         qkv_bias=state_decoder_params["qkv_bias"],
         complete_block=state_decoder_params["complete_block"],
@@ -293,6 +295,7 @@ def init_world_model(
         lr_scheduler=lr_scheduler,
         wd_scheduler=wd_scheduler,
         tb_logger=tensorlogger,
+        action_dims=action_dims,
         use_amp=use_amp,
         amp_dtype=amp_dtype,
         **kwargs

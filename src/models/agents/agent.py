@@ -78,6 +78,7 @@ class ActorCriticAgent():
                  gamma:float, lambd:float, entropy_coef:float,
                  use_amp:bool,
                  amp_dtype:torch.dtype,
+                 warmup:int|None=None,
                  clip_grad:float=10.0,
             ) -> None:
         super().__init__()
@@ -91,13 +92,6 @@ class ActorCriticAgent():
         self._slow_critic = copy.deepcopy(self._critic)
         self.modules: List[nn.Module] = [self._pooler, self._actor, self._critic, self._slow_critic]
 
-        # >> Training Setting
-        self.feat_len = feat_len
-        self.gamma = gamma
-        self.lambd = lambd
-        self.entropy_coef = entropy_coef
-        self._warmup = warmup if warmup is not None else self._lr_scheduler.warmup_steps
-        self._clip_grad = clip_grad
 
         # >> EMA scalars 
         self.lowerbound_ema = EMAScalar(decay=0.99)
@@ -115,7 +109,13 @@ class ActorCriticAgent():
         # >> Debug setting
         self._tb_logger = tb_logger
 
-        # >> training setting
+        # >> Training Setting
+        self.feat_len = feat_len
+        self.gamma = gamma
+        self.lambd = lambd
+        self.entropy_coef = entropy_coef
+        self._warmup = warmup if warmup is not None else self._lr_scheduler.warmup_steps
+        self._clip_grad = clip_grad
         self._use_amp = use_amp
         self._amp_dtype = amp_dtype
         self._step = 0
@@ -157,7 +157,7 @@ class ActorCriticAgent():
     def sample(self, feature:StateFeature, greedy=False):
         self.eval()
         with torch.amp.autocast(device_type=feature.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
-            latent = feature.as_time_patchs() # [B T P D]
+            latent = feature.as_time_patches() # [B T P D]
             latent = pool_sliding_window(latent, self.feat_len)[:,-1,:,:]
             logits = self.policy(latent)
             dist = self.dist_fn(logits)
@@ -178,7 +178,7 @@ class ActorCriticAgent():
         _new_wd = self._wd_scheduler.step()
         
         with torch.amp.autocast(device_type=feature.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
-            latent = feature.as_time_patchs()
+            latent = feature.as_time_patches()
             latent = pool_sliding_window(latent, self.feat_len) 
             logits, raw_value = self.get_logits_raw_value(latent)
             dist = self.dist_fn(logits[:, :-1,:])

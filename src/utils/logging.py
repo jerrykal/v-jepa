@@ -12,7 +12,7 @@ import torch
 
 from tensorboardX import SummaryWriter
 
-def gpu_timer(closure, log_timings=True):
+def gpu_timer(closure, log_timings=True, **kwargs):
     """ Helper to time gpu-time to execute closure() """
     log_timings = log_timings and torch.cuda.is_available()
 
@@ -22,7 +22,7 @@ def gpu_timer(closure, log_timings=True):
         end = torch.cuda.Event(enable_timing=True)
         start.record()
 
-    result = closure()
+    result = closure(**kwargs)
 
     if log_timings:
         end.record()
@@ -120,7 +120,7 @@ def adamw_logger(optimizer):
 
 
 class TensorboardLogger():
-    def __init__(self) -> None:
+    def __init__(self, path) -> None:
         self._writer = SummaryWriter(logdir=path, flush_secs=1)
         self._tag_step = {}
 
