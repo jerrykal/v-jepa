@@ -33,10 +33,10 @@ class RewardsDecoder(IDecoderHead):
     def __init__(self,
                  num_classes, input_dim, hidden_dim, depth=2 ):
         super().__init__(input_dim, hidden_dim, depth)
+        self.num_classes = num_classes
         self.proj = nn.Linear(hidden_dim, num_classes)
 
-    def forward(self, pooler, feat):
-        x = pooler(feat).squeeze(1) # [B N D] -> [B Q D]
+    def forward(self, x):
         x = self.backbone(x) 
         x = self.proj(x)
         return x
@@ -56,8 +56,7 @@ class TerminationDecoder(IDecoderHead):
         super().__init__(input_dim, hidden_dim, depth)
         self.proj = nn.Linear(hidden_dim, 1)
 
-    def forward(self, pooler, feat):
-        x = pooler(feat).squeeze(1) # [B N D] -> [B Q D]
+    def forward(self, x):
         x = self.backbone(x) 
         x = self.proj(x).squeeze(1)
         return x

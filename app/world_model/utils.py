@@ -24,7 +24,7 @@ from src.models.world_models.action_projector import ActionProjector
 from src.models.world_models.state_decoder import RewardsDecoder, TerminationDecoder
 from src.models.utils.multimask import (
     MultiMaskWrapper, PredictorMultiMaskWrapper, LatentActionEncoderMultiMaskWrapper)
-from torch.nn.parallel import DistributedDataParallel
+# from torch.nn.parallel import DistributedDataParallel
 from src.models.agents.actor_critic import Actor, Critic
 
 
@@ -225,15 +225,15 @@ def init_world_model(
         depth=action_projector_params["depth"], 
         quant=latent_action_enc.backbone.quant, 
     )
-    if not device == "cpu":
-        action_projector = DistributedDataParallel(action_projector)
-        state_pooler = DistributedDataParallel(state_pooler)
-        reward_decoder = DistributedDataParallel(reward_decoder)
-        termin_decoder = DistributedDataParallel(termin_decoder)
-        encoder = DistributedDataParallel(encoder)
-        target_encoder = DistributedDataParallel(target_encoder)
-        predictor = DistributedDataParallel(predictor)
-        latent_action_enc = DistributedDataParallel(latent_action_enc)
+    # if not device == "cpu":
+    #     action_projector = DistributedDataParallel(action_projector)
+    #     state_pooler = DistributedDataParallel(state_pooler)
+    #     reward_decoder = DistributedDataParallel(reward_decoder)
+    #     termin_decoder = DistributedDataParallel(termin_decoder)
+    #     encoder = DistributedDataParallel(encoder)
+    #     target_encoder = DistributedDataParallel(target_encoder)
+    #     predictor = DistributedDataParallel(predictor)
+    #     latent_action_enc = DistributedDataParallel(latent_action_enc)
 
     if pretrained_model_path is not None:
         (
@@ -248,7 +248,7 @@ def init_world_model(
             predictor=predictor,
             latent_action_enc=latent_action_enc,
             gradient=fine_tune, # If fine-tuning, propagate to each model
-            use_ddp=(not device == "cpu")
+            use_ddp=False
         )
 
     if pretrained_model_path is not None and not fine_tune:

@@ -50,10 +50,13 @@ from app.world_model.utils import (
     init_agent
 )
 
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 # --
 log_timings = True
 log_freq = 500
-checkpoint_freq = 500
+checkpoint_freq = 2500
 # --
 
 _GLOBAL_SEED = 0
@@ -272,8 +275,8 @@ def main(args, resume_preempt=False):
     )
 
     # -- load training checkpoint
-    if load_model or os.path.exists(latest_path):
-        CheckpointIO.load(latest_path)
+    if load_model and os.path.exists(latest_path):
+        CheckpointIO.load(world=world_model, agent=agent, path=latest_path)
 
     # -- init context qeue
     num_frames = video_model_params["num_frames"]
@@ -282,205 +285,209 @@ def main(args, resume_preempt=False):
     sum_reward = np.zeros(num_envs)
     current_obs, current_info = vec_env.reset()
 
+    logger.info("============================= [Training Start] =============================")
     # -- Training loop
-    for total_steps in range(max_steps//num_envs):
-        
-        # >> training script
-        def interactive(_current_obs, _current_info, _sum_reward):
-            world_model.eval()
-            agent.eval()
-            context_obs.append(rearrange(torch.Tensor(_current_obs.copy()).cuda(), "C H W -> 1 C 1 H W")/255) # [one env , len obs ,(obs) ]
-            with torch.no_grad():
-                if len(context_obs) != num_frames:
-                    action = vec_env.action_space.sample()
-                else:
-                    context_latent = world_model.encode(torch.cat(list(context_obs), dim=2))
-                    action = agent.sample_as_env_action(
-                        context_latent, greedy=False
+    with logging_redirect_tqdm():
+        for total_steps in tqdm(range(max_steps//num_envs)):
+            
+            # >> training script
+            def interactive(_current_obs, _current_info, _sum_reward):
+                world_model.eval()
+                agent.eval()
+                context_obs.append(rearrange(torch.Tensor(_current_obs.copy()).cuda(), "C H W -> 1 C 1 H W")/255) # [one env , len obs ,(obs) ]
+                with torch.no_grad():
+                    if len(context_obs) != num_frames:
+                        action = vec_env.action_space.sample()
+                    else:
+                        context_latent = world_model.encode(torch.cat(list(context_obs), dim=2))
+                        action = agent.sample_as_env_action(
+                            context_latent, greedy=False
+                        )
+                        action = np.squeeze(action)
+                obs, reward, done, truncated, info = vec_env.step(action)
+                # context_action.append(action) # STORM like actions buffer
+
+                replay_buffer.append(_current_obs, action, reward, done)
+                _sum_reward += reward
+
+                truncated = np.array([truncated])
+                done = np.array([done])
+                done_flag = np.logical_or(done, truncated)
+                if done_flag.any() :
+                    for i in range(num_envs):
+                        if done_flag:
+                            tb_logger.log(f"env/reward", _sum_reward[i],type='scalar')
+                            tb_logger.log(f"env/episode_steps", info["elapsed_steps"]//4,type='scalar')
+                            tb_logger.log("replay_buffer/length", len(replay_buffer),type='scalar')
+                            _sum_reward[i] = 0
+                            context_obs.clear()
+                            obs, info = vec_env.reset()
+                return obs, info, _sum_reward
+
+            def world_model_train_step():
+                world_model.train()
+                agent.eval()
+
+                obs, action, reward, termination  = replay_buffer.sample(
+                    batch_size=batch_size, external_batch_size=demon_batch_size, batch_length=seq_length, to_device=device
+                )
+                return world_model.update(
+                    sample_obs=obs, sample_action=action,
+                    sample_rewards=reward, sample_termin=termination,
+                )
+                
+
+            def agent_train_step():
+                world_model.eval()
+                agent.train()
+                obs, action, _, _  = replay_buffer.sample(
+                    batch_size=imagination_batch_size, 
+                    external_batch_size=imagination_demon_batch_size, 
+                    batch_length=imagination_context_length, to_device=device
+                )
+
+                context_latent = world_model.reset(
+                    sample_obs=obs, imagination_batch_size=imagination_batch_size, imagination_batch_length=imagination_seq_length)
+                for i in range(imagination_seq_length):
+                    action = agent.sample(context_latent)
+                    context_latent = world_model.step(action)
+                feature, actions, rewards, terminations = world_model.export(device)
+
+                return agent.update(
+                    feature=feature,
+                    action=actions,
+                    old_logprob=None, # not use
+                    old_value=None, # not use
+                    reward=rewards,
+                    termination=terminations,
+                )
+
+                
+            # >> Training flow
+            # >> World model and Agent interactive with Env
+            step_start_time = time.time()
+            (current_obs, current_info, sum_reward), interactive_gpu_etime_ms= gpu_timer(
+                interactive, True, _current_obs=current_obs, _current_info=current_info, _sum_reward=sum_reward)
+            interactive_wall_time_meter.update((time.time() - step_start_time) * 1000.)
+            interactive_gpu_time_meter.update(interactive_gpu_etime_ms)
+            if (total_steps % log_freq == 0):
+                logger.info(
+                    f"(interactive)[{total_steps}] "
+                    f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
+                    f"[gpu_time: {interactive_gpu_time_meter.avg:.1f} ms]"
+                    f"[wall_time: {interactive_wall_time_meter.avg:.1f} ms]"
+                )
+
+            # >> World model training
+            if replay_buffer.ready() and total_steps % (world_model_interval//num_envs) == 0:
+                step_start_time = time.time()
+                (world_model_debug_data), world_model_train_gpu_etime_ms= gpu_timer(world_model_train_step)
+                wm_update_wall_time_meter.update((time.time() - step_start_time) * 1000.)
+                wm_update_gpu_time_meter.update(world_model_train_gpu_etime_ms)
+
+                # >> World model Logging data
+                total_loss = world_model_debug_data["loss"]["total"]
+                action_loss = world_model_debug_data["loss"]["action"]
+                reward_loss = world_model_debug_data["loss"]["reward"]
+                termin_loss = world_model_debug_data["loss"]["termin"]
+
+                optim_stats = world_model_debug_data["optim_stats"]
+                new_lr = world_model_debug_data["lr"]
+                new_wd = world_model_debug_data["wd"]
+
+                wm_total_loss_meter.update(total_loss)
+                wm_action_loss_meter.update(action_loss)
+                wm_reward_loss_meter.update(reward_loss)
+                wm_termin_loss_meter.update(termin_loss)
+                
+                # >> TB logger
+                # TODO: Decoder decode JEPA feature or somtthing need record data
+
+                # >> Print
+                if (total_steps % log_freq == 0) or np.isnan(total_loss) or np.isinf(total_loss):
+                    logger.info(
+                        f"(world_model_train_step)[{total_steps}] "
+                        f"loss: {wm_total_loss_meter.avg:.3f} | "
+                        f"act:{wm_action_loss_meter.avg:.3f} rew:{wm_reward_loss_meter.avg:.3f} ter:{wm_termin_loss_meter.avg:.3f} | "
+                        f"[wd: {new_wd:.2e}] [lr: {new_lr:.2e}] "
+                        f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
+                        f"[gpu_time: {wm_update_gpu_time_meter.avg:.1f} ms]"
+                        f"[wall_time: {wm_update_wall_time_meter.avg:.1f} ms]"
                     )
-                    action = np.squeeze(action)
-            obs, reward, done, truncated, info = vec_env.step(action)
-            # context_action.append(action) # STORM like actions buffer
 
-            replay_buffer.append(_current_obs, action, reward, done)
-            _sum_reward += reward
+                    if optim_stats is not None:
+                        logger.info(
+                            f"(world_model_train_step)[{total_steps}] "
+                            f"first moment: {optim_stats.get('exp_avg').avg:.2e} [{optim_stats.get('exp_avg').min:2e} {optim_stats.get('exp_avg').max:2e}] "
+                            f"second moment: {optim_stats.get('exp_avg_sq').avg:2e} [{optim_stats.get('exp_avg_sq').min:2e} {optim_stats.get('exp_avg_sq').max:2e}]")
 
-            truncated = np.array([truncated])
-            done = np.array([done])
-            done_flag = np.logical_or(done, truncated)
-            if done_flag.any() :
-                for i in range(num_envs):
-                    if done_flag:
-                        tb_logger.log(f"env/reward", _sum_reward[i],type='scalar')
-                        tb_logger.log(f"env/episode_steps", info["elapsed_steps"]//4,type='scalar')
-                        tb_logger.log("replay_buffer/length", len(replay_buffer),type='scalar')
-                        _sum_reward[i] = 0
-                        context_obs.clear()
-                        obs, info = vec_env.reset()
-            return obs, info, _sum_reward
 
-        def world_model_train_step():
-            world_model.train()
-            agent.eval()
+                    for name, value in world_model_debug_data["train_model_state"].items():
+                        logger.info(f"(world_model_train_step)[{total_steps}] "
+                                    f"[{name}]: f/l[{value.first_layer:2e} {value.last_layer:2e}] "
+                                    f"mn/mx({value.min:2e}, {value.max:2e}) {value.global_norm:2e}")
+                
+                    assert not np.isnan(total_loss), 'loss is nan'
 
-            obs, action, reward, termination  = replay_buffer.sample(
-                batch_size=batch_size, external_batch_size=demon_batch_size, batch_length=seq_length, to_device=device
-            )
-            return world_model.update(
-                sample_obs=obs, sample_action=action,
-                sample_rewards=reward, sample_termin=termination,
-            )
-            
+            # >> Agent training
+            if replay_buffer.ready() and total_steps % (agent_interval//num_envs) == 0:
+                step_start_time = time.time()
+                (agent_debug_data), agent_train_gpu_etime_ms= gpu_timer(agent_train_step)
+                agent_update_wall_time_meter.update((time.time() - step_start_time) * 1000.)
+                agent_update_gpu_time_meter.update(agent_train_gpu_etime_ms)
 
-        def agent_train_step():
-            obs, action, _, _  = replay_buffer.sample(
-                batch_size=imagination_batch_size, 
-                external_batch_size=imagination_demon_batch_size, 
-                batch_length=imagination_context_length, to_device=device
-            )
+                # >> Agent Logging data
+                total_loss = agent_debug_data["loss"]["total"]
+                policy_loss = agent_debug_data["loss"]["policy"]
+                value_loss = agent_debug_data["loss"]["value"]
+                entropy_loss = agent_debug_data["loss"]["entropy"]
 
-            context_latent = world_model.reset(
-                sample_obs=obs, imagine_batch_size=imagination_batch_size, imagine_batch_length=imagination_seq_length)
-            for i in range(imagination_seq_length):
-                action = agent.sample(context_latent)
-                context_latent = world_model.step(action)
-            latents, actions, rewards, terminations = world_model.export()
+                optim_stats = agent_debug_data["optim_stats"]
+                new_lr = agent_debug_data["lr"]
+                new_wd = agent_debug_data["wd"]
 
-            return agent.update(
-                latent=latents,
-                action=actions,
-                old_logprob=None, # not use
-                old_value=None, # not use
-                reward=rewards,
-                termination=terminations,
-            )
-
-            
-        # >> Training flow
-        # >> World model and Agent interactive with Env
-        step_start_time = time.time()
-        (current_obs, current_info, sum_reward), interactive_gpu_etime_ms= gpu_timer(
-            interactive, True, _current_obs=current_obs, _current_info=current_info, _sum_reward=sum_reward)
-        interactive_wall_time_meter.update((time.time() - step_start_time) * 1000.)
-        interactive_gpu_time_meter.update(interactive_gpu_etime_ms)
-        if (total_steps % log_freq == 0):
-            logger.info(
-                f"(interactive)[{total_steps}] "
-                f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
-                f"[gpu_time: {interactive_gpu_time_meter.avg:.1f} ms]"
-                f"[wall_time: {interactive_wall_time_meter.avg:.1f} ms]"
-            )
-
-        # >> World model training
-        if replay_buffer.ready() and total_steps % (world_model_interval//num_envs) == 0:
-            step_start_time = time.time()
-            (world_model_debug_data), world_model_train_gpu_etime_ms= gpu_timer(world_model_train_step)
-            wm_update_wall_time_meter.update((time.time() - step_start_time) * 1000.)
-            wm_update_gpu_time_meter.update(world_model_train_gpu_etime_ms)
-
-            # >> World model Logging data
-            total_loss = world_model_debug_data["loss"]["total"]
-            action_loss = world_model_debug_data["loss"]["action"]
-            reward_loss = world_model_debug_data["loss"]["reward"]
-            termin_loss = world_model_debug_data["loss"]["termin"]
-
-            optim_stats = world_model_debug_data["optim_stats"]
-            new_lr = world_model_debug_data["lr"]
-            new_wd = world_model_debug_data["wd"]
-
-            wm_total_loss_meter.update(total_loss)
-            wm_action_loss_meter.update(action_loss)
-            wm_reward_loss_meter.update(reward_loss)
-            wm_termin_loss_meter.update(termin_loss)
-            
-            # >> TB logger
-            # TODO: Decoder decode JEPA feature or somtthing need record data
-
-            # >> Print
-            if (total_steps % log_freq == 0) or np.isnan(total_loss) or np.isinf(total_loss):
-                logger.info(
-                    f"(world_model_train_step)[{total_steps}] "
-                    f"loss: {wm_total_loss_meter.avg:.3f} | "
-                    f"act:{wm_action_loss_meter.avg:.3f} rew:{wm_reward_loss_meter.avg:.3f} ter:{wm_termin_loss_meter.avg:.3f} | "
-                    f"[wd: {new_wd:.2e}] [lr: {new_lr:.2e}] "
-                    f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
-                    f"[gpu_time: {wm_update_gpu_time_meter.avg:.1f} ms]"
-                    f"[wall_time: {wm_update_wall_time_meter.avg:.1f} ms]"
-                )
-
-                if optim_stats is not None:
+                agent_total_loss_meter.update(total_loss)
+                agent_policy_loss_meter.update(policy_loss)
+                agent_value_loss_meter.update(value_loss)
+                agent_entropy_loss_meter.update(entropy_loss)
+                
+                # >> Print
+                if (total_steps % log_freq == 0) or np.isnan(total_loss) or np.isinf(total_loss):
                     logger.info(
-                        f"(world_model_train_step)[{total_steps}] "
-                        f"first moment: {optim_stats.get('exp_avg').avg:.2e} [{optim_stats.get('exp_avg').min:2e} {optim_stats.get('exp_avg').max:2e}] "
-                        f"second moment: {optim_stats.get('exp_avg_sq').avg:2e} [{optim_stats.get('exp_avg_sq').min:2e} {optim_stats.get('exp_avg_sq').max:2e}]")
+                        f"(agent_train_step)[{total_steps}] "
+                        f"loss: {agent_total_loss_meter.avg:.3f} | "
+                        f"policy:{agent_policy_loss_meter.avg:.3f} value:{agent_value_loss_meter.avg:.3f} entropy:{agent_entropy_loss_meter.avg:.3f} | "
+                        f"[wd: {new_wd:.2e}] [lr: {new_lr:.2e}] "
+                        f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
+                        f"[gpu_time: {agent_update_gpu_time_meter.avg:.1f} ms]"
+                        f"[wall_time: {agent_update_wall_time_meter.avg:.1f} ms]"
+                    )
+
+                    if optim_stats is not None:
+                        logger.info(
+                            f"(agent_train_step)[{total_steps}] "
+                            f"first moment: {optim_stats.get('exp_avg').avg:.2e} [{optim_stats.get('exp_avg').min:2e} {optim_stats.get('exp_avg').max:2e}] "
+                            f"second moment: {optim_stats.get('exp_avg_sq').avg:2e} [{optim_stats.get('exp_avg_sq').min:2e} {optim_stats.get('exp_avg_sq').max:2e}]")
 
 
-                for name, value in world_model_debug_data["train_model_state"].items():
-                   logger.info(f"(world_model_train_step)[{total_steps}] "
-                               f"[{name}]: f/l[{value.first_layer:2e} {value.last_layer:2e}] "
-                               f"mn/mx({value.min:2e}, {value.max:2e}) {value.global_norm:2e}")
-             
-                assert not np.isnan(total_loss), 'loss is nan'
+                    for name, value in agent_debug_data["train_model_state"].items():
+                        logger.info(f"(agent_train_step)[{total_steps}] "
+                                    f"[{name}]: f/l[{value.first_layer:2e} {value.last_layer:2e}] "
+                                    f"mn/mx({value.min:2e}, {value.max:2e}) {value.global_norm:2e}")
+                
+                    assert not np.isnan(total_loss), 'loss is nan'
 
-        # >> Agent training
-        if replay_buffer.ready() and total_steps % (agent_interval//num_envs) == 0:
-            step_start_time = time.time()
-            (agent_debug_data), agent_train_gpu_etime_ms= gpu_timer(agent_train_step)
-            agent_update_wall_time_meter.update((time.time() - step_start_time) * 1000.)
-            agent_update_gpu_time_meter.update(agent_train_gpu_etime_ms)
-
-            # >> Agent Logging data
-            total_loss = agent_debug_data["loss"]["total"]
-            policy_loss = agent_debug_data["loss"]["policy"]
-            value_loss = agent_debug_data["loss"]["value"]
-            entropy_loss = agent_debug_data["loss"]["entropy"]
-
-            optim_stats = agent_debug_data["optim_stats"]
-            new_lr = agent_debug_data["lr"]
-            new_wd = agent_debug_data["wd"]
-
-            agent_total_loss_meter.update(total_loss)
-            agent_policy_loss_meter.update(policy_loss)
-            agent_value_loss_meter.update(value_loss)
-            agent_entropy_loss_meter.update(entropy_loss)
-            
-            # >> Print
-            if (total_steps % log_freq == 0) or np.isnan(total_loss) or np.isinf(total_loss):
-                logger.info(
-                    f"(world_model_train_step)[{total_steps}] "
-                    f"loss: {agent_total_loss_meter.avg:.3f} | "
-                    f"policy:{agent_policy_loss_meter.avg:.3f} value:{agent_value_loss_meter.avg:.3f} entropy:{agent_entropy_loss_meter.avg:.3f} | "
-                    f"[wd: {new_wd:.2e}] [lr: {new_lr:.2e}] "
-                    f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
-                    f"[gpu_time: {agent_update_gpu_time_meter.avg:.1f} ms]"
-                    f"[wall_time: {agent_update_wall_time_meter.avg:.1f} ms]"
-                )
-
-                if optim_stats is not None:
-                    logger.info(
-                        f"(world_model_train_step)[{total_steps}] "
-                        f"first moment: {optim_stats.get('exp_avg').avg:.2e} [{optim_stats.get('exp_avg').min:2e} {optim_stats.get('exp_avg').max:2e}] "
-                        f"second moment: {optim_stats.get('exp_avg_sq').avg:2e} [{optim_stats.get('exp_avg_sq').min:2e} {optim_stats.get('exp_avg_sq').max:2e}]")
-
-
-                for name, value in agent_debug_data["train_model_state"].items():
-                   logger.info(f"(world_model_train_step)[{total_steps}] "
-                               f"[{name}]: f/l[{value.first_layer:2e} {value.last_layer:2e}] "
-                               f"mn/mx({value.min:2e}, {value.max:2e}) {value.global_norm:2e}")
-             
-                assert not np.isnan(total_loss), 'loss is nan'
-
-        # >> Checkpoint save
-        if total_steps % checkpoint_freq == 0:
-            CheckpointIO.save(
-            world=world_model, agent=agent,
-            path=latest_path, logger=logger)
-        if save_interval > 0 and total_steps % save_interval == 0:
-            save_every_file = f'{tag}-step{total_steps}.pth.tar'
-            save_every_path = os.path.join(folder, save_every_file)
-            CheckpointIO.save(
+            # >> Checkpoint save
+            if total_steps % checkpoint_freq == 0:
+                CheckpointIO.save(
                 world=world_model, agent=agent,
-                path=save_every_path, logger=logger)
+                path=latest_path, logger=logger)
+            if save_interval > 0 and total_steps % save_interval == 0:
+                save_every_file = f'{tag}-step{total_steps}.pth.tar'
+                save_every_path = os.path.join(folder, save_every_file)
+                CheckpointIO.save(
+                    world=world_model, agent=agent,
+                    path=save_every_path, logger=logger)
             
 
     logger.info("Training Done!!!!!!1")

@@ -15,26 +15,20 @@ from src.models.agents.actor_critic import Actor, Critic
 
 logger = get_logger(__name__)
 
-def pool_sliding_window(
-        pooler:AttentivePooler, 
-        latent:torch.Tensor, 
-        clip_len:int):
+def pool_sliding_window(pooler, latent: torch.Tensor, clip_len: int):
     """
     latent: [B, T_full, P, D]
-    clip_len: T
-    return: [B, num_clips, D]
+    return: [B, num_clips, clip_len*D]
     """
     B, T_full, P, D = latent.shape
-    num_clips = T_full - clip_len + 1
-    assert num_clips > 0, f"clip_len too long, can't do sliding window, T_full:{T_full}, clip_len:{clip_len}, num_clips:{num_clips}"
+    assert clip_len <= T_full, f"clip_len too long: T_full={T_full}, clip_len={clip_len}"
 
-    latent = rearrange(latent,"B T P D -> (B T) P D")
-    latent = pooler(latent).squeeze(1)
-    latent = rearrange(latent,"(B T) D -> B T D", T=T_full)
-
-    windows = [rearrange(latent[:, t:t+clip_len], "B T D -> B 1 (T D)") for t in range(num_clips)]  
-    latent = torch.cat(windows, dim=1)  
-    return latent
+    x = rearrange(latent, "B T P D -> (B T) P D")           # [(B*T), P, D]
+    x = pooler(x).squeeze(1)                                # [(B*T), D]
+    x = x.view(B, T_full, D).contiguous()                   # [B, T, D]
+    xw = x.unfold(dimension=1, size=clip_len, step=1)
+    xw = xw.flatten(-2) 
+    return xw
 
 def percentile(x, percentage):
     flat_x = torch.flatten(x)
@@ -98,7 +92,7 @@ class ActorCriticAgent():
         self.upperbound_ema = EMAScalar(decay=0.99)
 
         # >> Loss
-        self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20)
+        self.symlog_twohot_loss = SymLogTwoHotLoss(255, -20, 20).cuda()
 
         # >> Optimization 
         self._optimizer = optimizer
@@ -171,7 +165,7 @@ class ActorCriticAgent():
         action = self.sample(latent, greedy)
         return action.detach().cpu().squeeze(-1).numpy()
     
-    def update(self, feature:StateFeature, action, old_logprob, old_value, reward, termination, clip_len, logger=None):
+    def update(self, feature:StateFeature, action, old_logprob, old_value, reward, termination, logger=None):
         self.train()
         # step LR and WD schedulers
         _new_lr = self._lr_scheduler.step()
@@ -181,7 +175,7 @@ class ActorCriticAgent():
             latent = feature.as_time_patches()
             latent = pool_sliding_window(self._pooler, latent, self.feat_len) 
             logits, raw_value = self.get_logits_raw_value(latent)
-            dist = self.dist_fn(logits[:, :-1,:])
+            dist = self.dist_fn(logits) # FIX: [:, :-1,:] ??
             log_prob = dist.log_prob(action)
             entropy = dist.entropy()
             entropy_loss = self.entropy_coef * entropy.mean()
@@ -193,22 +187,25 @@ class ActorCriticAgent():
             lambda_return = lambda_return_fn(reward, value, termination, self.gamma, self.lambd)
 
             # update value function with slow critic regularization
-            value_loss = self.symlog_twohot_loss(raw_value[:, :-1], lambda_return.detach())
-            slow_value_regularization_loss = self.symlog_twohot_loss(raw_value[:, :-1], slow_lambda_return.detach())
+            value_loss = self.symlog_twohot_loss(raw_value, lambda_return.detach()) # FIX: raw_value[:, :-1] ??
+            slow_value_regularization_loss = self.symlog_twohot_loss(raw_value, slow_lambda_return.detach()) # FIX: raw_value[:, :-1] ??
 
             lower_bound = self.lowerbound_ema(percentile(lambda_return, 0.05))
             upper_bound = self.upperbound_ema(percentile(lambda_return, 0.95))
             S = upper_bound-lower_bound
             norm_ratio = torch.max(torch.ones(1).cuda(), S)  # max(1, S) in the paper
-            norm_advantage = (lambda_return-value[:, :-1]) / norm_ratio
+            norm_advantage = (lambda_return - value) / norm_ratio # FIX: raw_value[:, :-1] ??
             policy_loss = -(log_prob * norm_advantage.detach()).mean()
 
             loss = policy_loss + value_loss + slow_value_regularization_loss - entropy_loss
 
         # gradient descent
+        _pooler_norm = 0.
+        _actor_norm = 0.
+        _critic_norm = 0.
         if self._use_amp:
             self._scaler.scale(loss).backward()
-            self._scaler.unscale_(self.optimizer)  # for clip grad
+            self._scaler.unscale_(self._optimizer)  # for clip grad
         else:
             loss.backward()
 

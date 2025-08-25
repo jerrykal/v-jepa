@@ -90,9 +90,9 @@ class WorldModel():
         self._tb_logger = tb_logger
         
         # >> Process setting
-        self.tubelet_size = self._context_encoder.backbone.module.tubelet_size # TODO
-        self.patch_size = self._context_encoder.backbone.module.patch_size # TODO
-
+        self.tubelet_size = self._context_encoder.backbone.tubelet_size 
+        self.patch_size = self._context_encoder.backbone.patch_size 
+        
         # >> Training setting
         self._use_amp = use_amp
         self._amp_dtype = amp_dtype
@@ -102,7 +102,7 @@ class WorldModel():
         self._num_last_frames = -3
 
         self._action_loss_fn = MSELoss()
-        self._reward_loss_fn = SymLogTwoHotLoss(num_classes=255, lower_bound=-20, upper_bound=20).cuda()
+        self._reward_loss_fn = SymLogTwoHotLoss(num_classes=rewards_decoder.num_classes, lower_bound=-20, upper_bound=20).cuda()
         self._termin_loss_fn = nn.BCEWithLogitsLoss()
 
         # >> Variables
@@ -114,7 +114,7 @@ class WorldModel():
         self._p = 0
 
         # Public: 
-        self.video_feature_dim = self._context_encoder.backbone.embed_dim #TODO
+        self.video_feature_dim = self._context_encoder.backbone.embed_dim 
         self.imagination_batch_size = -1
         self.imagination_batch_length = -1
         self.latent_buffer = None
@@ -130,23 +130,27 @@ class WorldModel():
             masks_e, masks_p    = build_masks(B=self._B, t=self._t, p=self._p, device=self._current_latent.device)
             pred_z              = self._predictor(z, None, masks_e, masks_p, act)[0] # list{[B P D]}[0]
         
-        self.latent_buffer[:,self._i:self._i+2] = self._current_latent[:,-2*self._p:].contiguous().view(self._B, 2, self._p, self.video_feature_dim).cpu() # [B i:i+1 P D]
-        self.action_buffer[:,self._i] = action.cpu()
+        self.latent_buffer[:,self._i:self._i+2] = self._current_latent[:,-2*self._p:].contiguous().view(self._B, 2, self._p, self.video_feature_dim) # [B i:i+1 P D]
+        self.action_buffer[:,self._i] = action
+
         self._current_latent = torch.concat([self._current_latent[:,self._p:], pred_z],dim=1)
         self.target_latent = torch.concat([self.target_latent[:,self._p:], pred_z],dim=1)
-        self.reward_hat_buffer[:,self._i] = self._rewards_decoder(self._state_pooler, self._current_latent[:,self._num_last_frames*self._p:,]).cpu()
-        self.termination_hat_buffer[:,self._i] = self._termin_decoder(self._state_pooler, self._current_latent[:,self._num_last_frames*self._p:,]).cpu()
+        pooled_z = self._state_pooler(self._current_latent[:,self._num_last_frames*self._p:,]).squeeze(1) 
+        
+        self.reward_hat_buffer[:,self._i] = self._reward_loss_fn.decode(self._rewards_decoder(pooled_z)).squeeze(-1) 
+        self.termination_hat_buffer[:,self._i] = (self._termin_decoder(pooled_z) > 0)
+
         self._bump_index()
-        return self.target_latent
+        return StateFeature(x=self.target_latent, t=self._t, p=self._p)
 
     def reset(self, sample_obs:torch.Tensor, imagination_batch_size:int, imagination_batch_length:int):
         with torch.no_grad():
-            self._init_buffer(imagination_batch_size, imagination_batch_length)
             B, C, T, H, W = sample_obs.shape
             self._B = B
             self._t = T // self.tubelet_size
             self._p = (H // self.patch_size) * (W // self.patch_size)
             self._i = 0
+            self._init_buffer(imagination_batch_size, imagination_batch_length)
             self._current_latent = self._context_encoder(sample_obs)
             self.target_latent = self._target_encoder(sample_obs)
         return StateFeature(x=self.target_latent, t=self._t, p=self._p)
@@ -169,7 +173,7 @@ class WorldModel():
                 This can slightly improve the efficiency of imagination data But may vary across different machines
             '''
             if self.imagination_batch_size != imagination_batch_size or self.imagination_batch_length != imagination_batch_length:
-                print(f"init_imagination_buffer: {imagination_batch_size}x{imagination_batch_length}@{self._amp_dtype}")
+                logger.info(f"init_imagination_buffer: {imagination_batch_size}x{imagination_batch_length}@{self._amp_dtype}")
 
                 self.imagination_batch_size = imagination_batch_size
                 self.imagination_batch_length = imagination_batch_length
@@ -233,7 +237,7 @@ class WorldModel():
             x = [rearrange(_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size)) for _z in target_z] \
                 if isinstance(target_z, list) else \
                 rearrange(target_z, "B (t p) D -> B t p D", t=T//self.tubelet_size, p=(H//self.patch_size)*(W//self.patch_size))
-            moduls = self._latent_act_encoder.module.backbone # TODO: DDP module. need drop
+            moduls = self._latent_act_encoder.backbone 
 
             # pass through temporal encoder blocks
             for block in moduls.enc_layer:
@@ -258,14 +262,17 @@ class WorldModel():
         def forward_action_project(real_action):
             return self._action_projector(real_action)
         
+        def forward_pooling(predicted_state):
+            x = predicted_state[0] if isinstance(predicted_state, list) else predicted_state
+            return self._state_pooler(x).squeeze(1) # [B N D] -> [B Q D]
+
         # >> helper: decode reward from latent state
-        def forward_rewards_decode(predicted_state):
-            x = predicted_state[0] if isinstance(predicted_state, list) else predicted_state
-            return self._rewards_decoder(self._state_pooler, x)
+        def forward_rewards_decode(x):
+            return self._rewards_decoder(x)
+        
         # >> helper: decode termination from latent state
-        def forward_termin_decode(predicted_state):
-            x = predicted_state[0] if isinstance(predicted_state, list) else predicted_state
-            return self._termin_decoder(self._state_pooler, x)
+        def forward_termin_decode(x):
+            return self._termin_decoder(x)
         
         # >> helper: loss wrappers 
         def action_loss_fn(real_act_embed, pseudo_act):
@@ -284,12 +291,13 @@ class WorldModel():
             target_z                = forward_target(sample_obs)
             pseudo_act, quant_idx   = forward_latent_action(target_z)
             _, full_z               = forward_prediction(sample_obs, mask_e, mask_p, pseudo_act)
-            hat_rewards             = forward_rewards_decode(full_z[:,self._num_last_frames*p:,])
-            hat_termins             = forward_termin_decode(full_z[:,self._num_last_frames*p:,])
+            pooled_z                = forward_pooling(full_z[:,self._num_last_frames*p:,])
+            hat_rewards             = forward_rewards_decode(pooled_z)
+            hat_termins             = forward_termin_decode(pooled_z)
             _, proj_quant_vec       = forward_action_project(sample_action[:,-1,:])
 
             # compute action target from quantizer codebook
-            target_quant_vec = self._latent_act_encoder.backbone.quant.codebook(quant_idx)
+            target_quant_vec = self._latent_act_encoder.backbone.quant.codebook(quant_idx) 
             loss_action = action_loss_fn(proj_quant_vec, target_quant_vec)
             loss_reward = reward_loss_fn(hat_rewards, sample_rewards[:,-1])
             loss_termin = termin_loss_fn(hat_termins, sample_termin[:,-1])
