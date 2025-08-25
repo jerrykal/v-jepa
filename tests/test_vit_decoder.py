@@ -12,8 +12,7 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image
 
-import src.datasets.utils.video.transforms as video_transforms
-import src.datasets.utils.video.volume_transforms as volume_transforms
+from app.vit_decoder.transforms import make_eval_transforms, unnormalize_tensor
 from app.vit_decoder.utils import (
     init_models,
     load_checkpoint,
@@ -24,29 +23,6 @@ from src.datasets.data_manager import init_data
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def unnormalize_tensor(
-    tensor: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
-) -> torch.Tensor:
-    """
-    Args:
-        tensor: torch.Tensor, shape [B, C, F, H, W], values in [0, 1]
-        mean: torch.Tensor, shape [C], mean values
-        std: torch.Tensor, shape [C], std values
-
-    Returns:
-        torch.Tensor, shape [B, C, F, H, W], values in [0, 1]
-    """
-    tensor = tensor.clone().contiguous()
-    mean = mean.to(tensor.device).unsqueeze(0)
-    std = std.to(tensor.device).unsqueeze(0)
-
-    B, C, F, H, W = tensor.shape
-    tensor = tensor.view(B, C, -1).permute(0, 2, 1)
-    tensor.mul_(std).add_(mean)
-    tensor = tensor.permute(0, 2, 1).view(B, C, F, H, W)
-    return tensor
 
 
 def save_tensor_as_gif(
@@ -147,17 +123,7 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
 
     # Make data transforms
-    short_side_size = int(crop_size * 256 / 224)
-    normalize_mean = torch.tensor([0.485, 0.456, 0.406])
-    normalize_std = torch.tensor([0.229, 0.224, 0.225])
-    transform = video_transforms.Compose(
-        [
-            video_transforms.Resize(short_side_size, interpolation="bilinear"),
-            video_transforms.CenterCrop(size=(crop_size, crop_size)),
-            volume_transforms.ClipToTensor(),
-            video_transforms.Normalize(mean=normalize_mean, std=normalize_std),
-        ]
-    )
+    transform = make_eval_transforms(crop_size=crop_size)
 
     # Init data-loaders/samplers
     (unsupervised_loader, unsupervised_sampler) = init_data(
@@ -220,10 +186,8 @@ def main() -> None:
         )
 
     # Unnormalize the original and reconstructed clips for visualization
-    clips_unnormalized = unnormalize_tensor(clips, normalize_mean, normalize_std)
-    reconstructed_unnormalized = unnormalize_tensor(
-        reconstructed, normalize_mean, normalize_std
-    )
+    clips_unnormalized = unnormalize_tensor(clips)
+    reconstructed_unnormalized = unnormalize_tensor(reconstructed)
 
     # Combine the original and reconstructed clips side by side for comparison
     side_by_side_imgs = torch.cat(
