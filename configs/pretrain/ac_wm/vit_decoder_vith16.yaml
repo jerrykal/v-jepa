@@ -44,7 +44,7 @@ meta:
   dtype: bfloat16
   pre_train_model: weights/vith16.pth.tar
   eval_freq: 1
-  save_every_freq: 100
+  save_every_freq: 200
 
 model:
   model_name: vit_huge

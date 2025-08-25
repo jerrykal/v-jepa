@@ -13,18 +13,23 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from torch.nn.parallel import DistributedDataParallel
 
-import src.datasets.utils.video.transforms as video_transforms
-import src.datasets.utils.video.volume_transforms as volume_transforms
+from app.vit_decoder.transforms import (
+    make_eval_transforms,
+    make_train_transforms,
+    unnormalize_tensor,
+)
 from app.vit_decoder.utils import (
     init_models,
     init_opt,
     load_checkpoint,
     load_jepa_encoder,
     patchify,
+    unpatchify,
 )
-from app.vjepa.transforms import make_transforms
 from src.datasets.data_manager import init_data
 from src.utils.distributed import AllReduce, init_distributed
 from src.utils.logging import (
@@ -172,8 +177,10 @@ def main(args, resume_preempt=False):
     eval_log_file = os.path.join(folder, f"{tag}_r{rank}_eval.csv")
     latest_file = f"{tag}-latest.pth.tar"
     latest_path = os.path.join(folder, latest_file)
-    best_file = f"{tag}-best.pth.tar"
-    best_path = os.path.join(folder, best_file)
+    best_psnr_file = f"{tag}-best-psnr.pth.tar"
+    best_psnr_path = os.path.join(folder, best_psnr_file)
+    best_ssim_file = f"{tag}-best-ssim.pth.tar"
+    best_ssim_path = os.path.join(folder, best_ssim_file)
     load_path = None
     if load_model:
         load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
@@ -195,7 +202,8 @@ def main(args, resume_preempt=False):
         eval_csv_logger = CSVLogger(
             eval_log_file,
             ("%d", "epoch"),
-            ("%.5f", "loss"),
+            ("%.5f", "psnr"),
+            ("%.5f", "ssim"),
         )
 
     # -- init model
@@ -215,7 +223,7 @@ def main(args, resume_preempt=False):
     )
 
     # -- make data transforms
-    train_transform = make_transforms(
+    train_transform = make_train_transforms(
         random_horizontal_flip=True,
         random_resize_aspect_ratio=ar_range,
         random_resize_scale=rr_scale,
@@ -224,17 +232,7 @@ def main(args, resume_preempt=False):
         motion_shift=motion_shift,
         crop_size=crop_size,
     )
-    short_side_size = int(crop_size * 256 / 224)
-    normalize_mean = torch.tensor([0.485, 0.456, 0.406])
-    normalize_std = torch.tensor([0.229, 0.224, 0.225])
-    eval_transform = video_transforms.Compose(
-        [
-            video_transforms.Resize(short_side_size, interpolation="bilinear"),
-            video_transforms.CenterCrop(size=(crop_size, crop_size)),
-            volume_transforms.ClipToTensor(),
-            video_transforms.Normalize(mean=normalize_mean, std=normalize_std),
-        ]
-    )
+    eval_transform = make_eval_transforms(crop_size=crop_size)
 
     # -- init data-loaders/samplers
     train_loader, train_sampler = init_data(
@@ -358,7 +356,8 @@ def main(args, resume_preempt=False):
                 udata = next(loader)
 
     # -- TRAINING LOOP
-    best_eval_loss = float("inf")
+    best_psnr = float("-inf")
+    best_ssim = float("-inf")
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
 
@@ -526,7 +525,8 @@ def main(args, resume_preempt=False):
         # -- EVALUATION
         if eval_freq > 0 and (epoch + 1) % eval_freq == 0:
             logger.info("Evaluating...")
-            eval_loss_meter = AverageMeter()
+            eval_psnr_meter = AverageMeter()
+            eval_ssim_meter = AverageMeter()
 
             encoder.eval()
             decoder.eval()
@@ -540,26 +540,52 @@ def main(args, resume_preempt=False):
                     jepa_features = F.layer_norm(
                         jepa_features, (jepa_features.size(-1),)
                     )
-                    pred = decoder(jepa_features)
-                    target = patchify(clips, patch_size, tubelet_size)
-                    loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                    preds = decoder(jepa_features)
+                    preds = unpatchify(
+                        preds, crop_size, num_frames, patch_size, tubelet_size
+                    )
 
-                    eval_loss_meter.update(loss)
+                    targets = unnormalize_tensor(clips)
+                    targets = rearrange(targets, "b c f h w -> (b f) h w c")
+
+                    preds = unnormalize_tensor(preds)
+                    preds = preds.clamp(0.0, 1.0)
+                    preds = rearrange(preds, "b c f h w -> (b f) h w c")
+
+                    target_np = targets.cpu().numpy()
+                    pred_np = preds.cpu().numpy()
+
+                    for target, pred in zip(target_np, pred_np):
+                        psnr = peak_signal_noise_ratio(target, pred, data_range=1.0)
+                        ssim = structural_similarity(
+                            target, pred, data_range=1.0, channel_axis=2
+                        )
+                        eval_psnr_meter.update(psnr)
+                        eval_ssim_meter.update(ssim)
 
             # Log evaluation stats
             eval_csv_logger.log(
                 epoch + 1,
-                eval_loss_meter.avg,
+                eval_psnr_meter.avg,
+                eval_ssim_meter.avg,
             )
-            logger.info(f"Evaluation loss: {eval_loss_meter.avg:.3f}")
+            logger.info(
+                f"Evaluation PSNR: {eval_psnr_meter.avg:.3f}, SSIM: {eval_ssim_meter.avg:.3f}"
+            )
 
             # Saving best checkpoint
-            if eval_loss_meter.avg < best_eval_loss:
+            if eval_psnr_meter.avg > best_psnr:
                 logger.info(
-                    f"New best evaluation loss: {eval_loss_meter.avg:.3f}, saving..."
+                    f"New best evaluation PSNR: {eval_psnr_meter.avg:.3f}, saving..."
                 )
-                best_eval_loss = eval_loss_meter.avg
-                save_checkpoint(epoch + 1, best_path)
+                best_psnr = eval_psnr_meter.avg
+                save_checkpoint(epoch + 1, best_psnr_path)
+            if eval_ssim_meter.avg > best_ssim:
+                logger.info(
+                    f"New best evaluation SSIM: {eval_ssim_meter.avg:.3f}, saving..."
+                )
+                best_ssim = eval_ssim_meter.avg
+                save_checkpoint(epoch + 1, best_ssim_path)
 
             encoder.train()
             decoder.train()
