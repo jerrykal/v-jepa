@@ -27,7 +27,6 @@ from app.vit_decoder.utils import (
     init_opt,
     load_checkpoint,
     load_jepa_encoder,
-    patchify,
     unpatchify,
 )
 from src.datasets.data_manager import init_data
@@ -40,6 +39,7 @@ from src.utils.logging import (
     gpu_timer,
     grad_logger,
 )
+from src.utils.loss import PerceptualLoss
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -144,6 +144,7 @@ def main(args, resume_preempt=False):
     betas = cfgs_opt.get("betas", (0.9, 0.999))
     wd = float(cfgs_opt.get("weight_decay"))
     eps = cfgs_opt.get("eps", 1.0e-8)
+    perceptual_loss_weight = cfgs_opt.get("perceptual_loss_weight", 0.0)
 
     # -- LOGGING
     cfgs_logging = args.get("logging")
@@ -194,6 +195,8 @@ def main(args, resume_preempt=False):
         ("%d", "epoch"),
         ("%d", "itr"),
         ("%.5f", "loss"),
+        ("%.5f", "reconstruction_loss"),
+        ("%.5f", "perceptual_loss"),
         ("%.5f", "grad-norm"),
         ("%d", "gpu-time(ms)"),
         ("%d", "wall-time(ms)"),
@@ -298,6 +301,10 @@ def main(args, resume_preempt=False):
         eps=eps,
     )
 
+    # -- init perceptual loss function
+    if perceptual_loss_weight > 0.0:
+        perceptual_loss_fn = PerceptualLoss().to(device)
+
     # -- freeze encoder
     for p in encoder.parameters():
         p.requires_grad = False
@@ -365,6 +372,8 @@ def main(args, resume_preempt=False):
         train_sampler.set_epoch(epoch)
 
         loss_meter = AverageMeter()
+        reconstruction_loss_meter = AverageMeter()
+        perceptual_loss_meter = AverageMeter()
         input_var_meter = AverageMeter()
         input_var_min_meter = AverageMeter()
         gpu_time_meter = AverageMeter()
@@ -402,11 +411,23 @@ def main(args, resume_preempt=False):
                     # Reconstruct video clips from encoded representations
                     pred = decoder(jepa_features)
 
-                    # Patchify video clips to obtain target patches
-                    target = patchify(clips, patch_size, tubelet_size)
+                    pred = unpatchify(
+                        pred, crop_size, num_frames, patch_size, tubelet_size
+                    )
+                    pred = rearrange(pred, "b c f h w -> (b f) c h w")
+                    target = rearrange(clips, "b c f h w -> (b f) c h w")
 
-                    # Compute the loss
-                    loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                    # Pixel-wise MSE loss
+                    reconstruction_loss = F.mse_loss(pred, target, reduction="mean")
+
+                    # Perceptual loss
+                    perceptual_loss = 0.0
+                    if perceptual_loss_weight > 0.0:
+                        perceptual_loss = perceptual_loss_weight * perceptual_loss_fn(
+                            pred, target
+                        )
+
+                    loss = reconstruction_loss + perceptual_loss
 
                 # Step 2. Backward & step
                 _dec_norm = 0.0
@@ -430,6 +451,8 @@ def main(args, resume_preempt=False):
                 optim_stats = adamw_logger(optimizer)
 
                 return (
+                    float(reconstruction_loss),
+                    float(perceptual_loss),
                     float(loss),
                     _new_lr,
                     grad_stats,
@@ -438,6 +461,8 @@ def main(args, resume_preempt=False):
 
             (
                 (
+                    reconstruction_loss,
+                    perceptual_loss,
                     loss,
                     _new_lr,
                     grad_stats,
@@ -447,6 +472,8 @@ def main(args, resume_preempt=False):
             ) = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
+            reconstruction_loss_meter.update(reconstruction_loss)
+            perceptual_loss_meter.update(perceptual_loss)
             input_var = float(
                 AllReduce.apply(clips.view(clips.shape[0], -1).var(dim=1).mean(dim=0))
             )
@@ -464,13 +491,15 @@ def main(args, resume_preempt=False):
                     epoch + 1,
                     itr,
                     loss,
+                    reconstruction_loss,
+                    perceptual_loss,
                     grad_stats.global_norm,
                     gpu_etime_ms,
                     iter_elapsed_time_ms,
                 )
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                     logger.info(
-                        "[%d, %5d] loss: %.3f | "
+                        "[%d, %5d] loss: %.3f | reconstruction_loss: %.3f | perceptual_loss: %.3f | "
                         "input_var: %.3f %.3f | "
                         "[lr: %.2e] "
                         "[mem: %.2e] "
@@ -480,6 +509,8 @@ def main(args, resume_preempt=False):
                             epoch + 1,
                             itr,
                             loss_meter.avg,
+                            reconstruction_loss_meter.avg,
+                            perceptual_loss_meter.avg,
                             input_var_meter.avg,
                             input_var_min_meter.avg,
                             _new_lr,
