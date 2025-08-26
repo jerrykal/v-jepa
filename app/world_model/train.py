@@ -39,8 +39,7 @@ from src.utils.logging import (
     get_logger,
     AverageMeter,
     TensorboardLogger)
-from torch.nn.parallel import DistributedDataParallel
-from src.utils.tensors import repeat_interleave_batch
+from src.utils.tensors import normalize_tensor
 from src.utils.action_parser import ActionParser
 from app.world_model.ckpt_io import CheckpointIO
 
@@ -56,7 +55,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 # --
 log_timings = True
 log_freq = 500
-checkpoint_freq = 2500
+checkpoint_freq = 1000
 # --
 
 _GLOBAL_SEED = 0
@@ -97,7 +96,7 @@ def main(args, resume_preempt=False):
     latent_action_enc_params = cfgs_wm["latent_action_enc_params"]
     state_decoder_params = cfgs_wm["state_decoder_params"]
     action_projector_params = cfgs_wm["action_projector_params"]
-    optimizer_params = cfgs_wm["optimizer_params"]
+    world_model_optimizer_params = cfgs_wm["optimizer_params"]
     pretrained_model_path = cfgs_wm["pretrained_model_path"]
     fine_tune = cfgs_wm["fine_tune"]
 
@@ -107,13 +106,13 @@ def main(args, resume_preempt=False):
     pooler_params = cfgs_agent["pooler_params"]
     actor_params = cfgs_agent["actor_params"]
     critic_params = cfgs_agent["critic_params"]
+    agent_optimizer_params = cfgs_wm["optimizer_params"]
     gamma = cfgs_agent["gamma"]
     lambd = cfgs_agent["lambd"]
     entropy_coef = cfgs_agent["entropy_coef"]
 
     # -- ENV
-    cfgs_env = args.get('env')
-    frame_skip = cfgs_env["frame_skip"]
+    cfgs_env = args.get('env') 
     maxpooling = cfgs_env["maxpooling"]
 
     # -- REPALY BUFFER
@@ -211,6 +210,7 @@ def main(args, resume_preempt=False):
     agent_update_wall_time_meter = AverageMeter()
 
     # -- init environment
+    frame_skip = video_model_params["tubelet_size"]  # Number of frames skipped per step; kept in sync with video encoder's tubelet size
     vec_env = env_factory.build_single_env(
         cfgs_env, frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
     action_dims = list(vec_env.action_space.nvec)
@@ -248,7 +248,7 @@ def main(args, resume_preempt=False):
         latent_action_enc_params=latent_action_enc_params,
         state_decoder_params=state_decoder_params,
         action_projector_params=action_projector_params,
-        optimizer_params=optimizer_params,
+        optimizer_params=world_model_optimizer_params,
         tensorlogger=tb_logger,
         action_dims=action_dims,
         pretrained_model_path=pretrained_model_path,
@@ -263,7 +263,7 @@ def main(args, resume_preempt=False):
         pooler_params=pooler_params,
         actor_params=actor_params,
         critic_params=critic_params,
-        optimizer_params=optimizer_params,
+        optimizer_params=agent_optimizer_params,
         input_dim=world_model.video_feature_dim,
         feat_len=feat_len,
         action_dim=action_dims, 
@@ -281,7 +281,6 @@ def main(args, resume_preempt=False):
     # -- init context qeue
     num_frames = video_model_params["num_frames"]
     context_obs = deque(maxlen=num_frames)
-    # context_action = deque(maxlen=num_frames)
     sum_reward = np.zeros(num_envs)
     current_obs, current_info = vec_env.reset()
 
@@ -294,7 +293,9 @@ def main(args, resume_preempt=False):
             def interactive(_current_obs, _current_info, _sum_reward):
                 world_model.eval()
                 agent.eval()
-                context_obs.append(rearrange(torch.Tensor(_current_obs.copy()).cuda(), "C H W -> 1 C 1 H W")/255) # [one env , len obs ,(obs) ]
+                for _obs in _current_info["all_obs"] :
+                    context_obs.append(normalize_tensor(rearrange(torch.Tensor(_obs.copy()).cuda(), "C H W -> 1 C 1 H W") / 255)) # [one env , len obs ,(obs)]
+
                 with torch.no_grad():
                     if len(context_obs) != num_frames:
                         action = vec_env.action_space.sample()
@@ -305,9 +306,9 @@ def main(args, resume_preempt=False):
                         )
                         action = np.squeeze(action)
                 obs, reward, done, truncated, info = vec_env.step(action)
-                # context_action.append(action) # STORM like actions buffer
 
-                replay_buffer.append(_current_obs, action, reward, done)
+                for _obs in _current_info["all_obs"] :
+                    replay_buffer.append(_obs, action, reward, done) # obs_t, act_t, reward_{t+1}, done_{t+1}
                 _sum_reward += reward
 
                 truncated = np.array([truncated])
@@ -316,9 +317,9 @@ def main(args, resume_preempt=False):
                 if done_flag.any() :
                     for i in range(num_envs):
                         if done_flag:
-                            tb_logger.log(f"env/reward", _sum_reward[i],type='scalar')
-                            tb_logger.log(f"env/episode_steps", info["elapsed_steps"]//4,type='scalar')
-                            tb_logger.log("replay_buffer/length", len(replay_buffer),type='scalar')
+                            tb_logger.log(f"Env/reward", _sum_reward[i],type='scalar')
+                            tb_logger.log(f"Env/episode_steps", info["elapsed_steps"]//4,type='scalar')
+                            tb_logger.log("Replay_buffer/length", len(replay_buffer),type='scalar')
                             _sum_reward[i] = 0
                             context_obs.clear()
                             obs, info = vec_env.reset()
@@ -345,13 +346,13 @@ def main(args, resume_preempt=False):
                     external_batch_size=imagination_demon_batch_size, 
                     batch_length=imagination_context_length, to_device=device
                 )
-
-                context_latent = world_model.reset(
-                    sample_obs=obs, imagination_batch_size=imagination_batch_size, imagination_batch_length=imagination_seq_length)
-                for i in range(imagination_seq_length):
-                    action = agent.sample(context_latent)
-                    context_latent = world_model.step(action)
-                feature, actions, rewards, terminations = world_model.export(device)
+                with torch.no_grad():
+                    context_latent = world_model.reset(
+                        sample_obs=obs, imagination_batch_size=imagination_batch_size, imagination_batch_length=imagination_seq_length)
+                    for i in range(imagination_seq_length):
+                        action = agent.sample(context_latent)
+                        context_latent = world_model.step(action)
+                    feature, actions, rewards, terminations = world_model.export(device)
 
                 return agent.update(
                     feature=feature,

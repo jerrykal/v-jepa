@@ -131,7 +131,7 @@ class TensorboardLogger():
 
     def log(self, tag, value, type='scalar', **kwargs):
         _step = self._log_count(tag)
-        _tag = f"{type}/{tag}"
+        _tag = tag #f"{type}/{tag}"
         if type == 'scalar':
             self._writer.add_scalar(_tag, value, _step)
         elif type == 'image':

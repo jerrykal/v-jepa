@@ -64,7 +64,7 @@ class MineDojoGymnasium(gymnasium.Env):
         return obs['rgb'],\
             {
                 'elapsed_steps':1,
-                'all_obs':[obs['rgb']]
+                'all_obs':[obs['rgb']] * self.skip
             }
 
     def close(self):

@@ -1,6 +1,7 @@
 app: world_model
 nodes: 16
 tasks_per_node: 8
+
 # ======================================================================= #
 #  CONFIGURATION FILE
 # ======================================================================= #
@@ -11,33 +12,36 @@ meta:
   seed: 234                      # Random seed
   dtype: bfloat16                # Options: float32 | float16 | bfloat16
 
+
 # ======================================================================= #
 #  WORLD MODEL
 # ======================================================================= #
 world_model:
-  pretrained_model_path: "/media/cgv/1tb_disk/vith16.pth.tar"    # Path to pretrained world model checkpoint
+  
+  pretrained_model_path: null         # Path to pretrained world model checkpoint
   fine_tune: false                    # If true, fine-tune encoder/predictor/etc.
 
   video_model_params:
-    model_name: vit_huge                # Backbone name
-    patch_size: 16                      # Spatial patch size
-    num_frames: 16                      # Number of frames per clip
-    tubelet_size: 2                     # Temporal patching (frames per tubelet)
-    crop_size: 224                      # Crop resolution
-    pred_depth: 12                       # Predictor transformer depth
-    pred_embed_dim: 384                 # Predictor embedding dim
-    uniform_power: true                  # Sampling power for uniform sampling
-    use_mask_tokens: true               # Whether to use mask tokens
-    adapter_type: "Concat"                # Adapter type: none|linear|lora...
+    model_name: vit_huge               # Backbone name
+    patch_size: 16                     # Spatial patch size
+    num_frames: 16                     # Number of frames per clip
+    tubelet_size: 2                    # Temporal patching (frames per tubelet)
+    crop_size: 224                     # Crop resolution
+    pred_depth: 12                     # Predictor transformer depth
+    pred_embed_dim: 384                # Predictor embedding dim
+    uniform_power: true                # Sampling power for uniform sampling
+    use_mask_tokens: true              # Whether to use mask tokens
+    adapter_type: "Concat"             # Adapter type: none|linear|lora|Concat...
+    zero_init_mask_tokens: true        # Initialize mask tokens with zero
 
   latent_action_enc_params:
     num_heads: 8              # Attention heads
-    d_codebook: 10            # Dimension per codebook
-    n_codebook: 1             # Number of codebooks
-    vq_bias: false            # Use bias in VQ projection
+    d_codebook: 16             # Dimension per codebook (dims_action_codebook)
+    n_codebook: 2             # Number of codebooks (number_action_codebook)
+    vq_bias: true             # LFQ bias
     vq_commit_weight: 0.25    # Commitment loss weight
-    vq_entropy_weight: 0.0    # Entropy regularization weight
-    vq_diversity_weight: 0.0  # Diversity regularization weight
+    vq_entropy_weight: 0.1    # Entropy regularization weight
+    vq_diversity_weight: 1.0  # Diversity regularization weight
 
   state_decoder_params:
     # Pooler
@@ -53,14 +57,14 @@ world_model:
     # Rewards decoder
     reward_hidden_dim: 512      # Hidden dim
     reward_depth: 2             # Number of layers
-    reward_num_classes: 1       # Output classes (1 for regression)
+    reward_num_classes: 255       # Output classes (1 for regression)
 
     # Termination decoder
     termin_hidden_dim: 256      # Hidden dim
     termin_depth: 2             # Number of layers
 
   action_projector_params:
-    hidden_dims: [512, 512]     # Hidden layers
+    hidden_dims: 512            # Hidden layers
     depth: 2                    # Number of hidden layers
 
   optimizer_params:
@@ -80,7 +84,7 @@ world_model:
 #  AGENT
 # ======================================================================= #
 agent:
-  feat_len: 16                   # Sequence length pooled for agent
+  feat_len: 2                   # Sequence length pooled for agent
   gamma: 0.99                    # Discount factor
   lambd: 0.95                    # GAE lambda
   entropy_coef: 0.01             # Entropy coefficient
@@ -101,13 +105,26 @@ agent:
   critic_params:
     hidden_dim: 512
     num_layers: 2
-    output_bins: 255               # Critic output bins (e.g. for value dist)
+    output_bins: 255             # Critic output bins (e.g. for value dist)
+    
+  optimizer_params:
+    start_lr: 1.0e-6            # LR at start of warmup
+    ref_lr: 3.0e-4              # Reference LR
+    warmup_ratio: 0.05          # Warmup steps ratio
+    wd: 0.05                    # Weight decay
+    final_wd: 0.0               # Final weight decay
+    final_lr: 1.0e-7            # Final learning rate
+    mixed_precision: true       # Enable AMP
+    total_steps: 1000000        # Total steps
+    betas: [0.9, 0.95]          # Adam betas
+    eps: 1.0e-8                 # Adam epsilon
+    zero_init_bias_wd: false    # Exempt zero-init bias from wd
 
 # ======================================================================= #
 #  ENVIRONMENT
 # ======================================================================= #
 env:
-  env_params:                           # Environment-specific parameters
+  Environment:                           # Environment-specific parameters
     task: "CombatSpider"
     task_parameter:
       image_size: [224,224]
@@ -129,33 +146,33 @@ env:
 #  REPLAY BUFFER
 # ======================================================================= #
 replay_buffer:
-  max_length: 1000000            # Maximum buffer length
-  warmup_length: 10000           # Steps before training
-  store_on_gpu: false            # Store buffer on GPU
-  export_data_path: null         # Path to export data
-  pre_collected_data_path: null  # Path to pre-collected dataset
+  max_length: 100000              # Maximum buffer length
+  warmup_length: 1024             # Steps before training
+  store_on_gpu: false             # Store buffer on GPU
+  export_data_path: null          # Path to export data
+  pre_collected_data_path: null   # Path to pre-collected dataset
 
 # ======================================================================= #
 #  OPTIMIZATION
 # ======================================================================= #
 optimization:
-  max_steps: 1000000             # Total training steps
+  max_steps: 102000             # Total training steps
   num_envs: 1                    # Number of parallel environments
 
   train:
-    batch_size: 32               # Training batch size
+    batch_size: 16               # Training batch size
     seq_length: 16               # Sequence length for training
-    save_interval: 1000          # Interval for checkpoint saving
+    save_interval: 5000          # Interval for checkpoint saving
 
   demonstration:
     enabled: false               # Enable demonstrations
-    batch_size: 32               # Demonstration batch size
+    batch_size: 4                # Demonstration batch size
 
   imagination:
-    batch_size: 32               # Imagination rollout batch size
+    batch_size: 16               # Imagination rollout batch size
     seq_length: 16               # Imagination sequence length
-    context_length: 4            # Context length
-    demo_batch_size: 16          # Demonstration batch size for imagination
+    context_length: 16            # Context length
+    demo_batch_size: 256         # Demonstration batch size for imagination
 
   update:
     world_model_interval: 1      # Interval for world model update
