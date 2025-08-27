@@ -127,11 +127,11 @@ def main(args, resume_preempt=False):
     cfgs_opt = args.get('optimization')
     max_steps = cfgs_opt["max_steps"]
     num_envs = cfgs_opt["num_envs"]
+    save_interval = cfgs_opt["save_interval"]
 
     train_setting = cfgs_opt["train"]
     batch_size = train_setting["batch_size"]
     seq_length = train_setting["seq_length"]
-    save_interval = train_setting["save_interval"]
 
     demonstration_setting = cfgs_opt["demonstration"]
     demon_enable = demonstration_setting["enabled"]

@@ -156,13 +156,13 @@ replay_buffer:
 #  OPTIMIZATION
 # ======================================================================= #
 optimization:
-  max_steps: 102000             # Total training steps
+  max_steps: 105000             # Total training steps
   num_envs: 1                    # Number of parallel environments
+  save_interval: 5000          # Interval for checkpoint saving
 
   train:
     batch_size: 16               # Training batch size
     seq_length: 16               # Sequence length for training
-    save_interval: 5000          # Interval for checkpoint saving
 
   demonstration:
     enabled: false               # Enable demonstrations

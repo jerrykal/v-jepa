@@ -124,21 +124,22 @@ class WorldModel():
 
     # Interactive function 
     def step(self, action):
-        with torch.no_grad():
-            (act, _), _         = self._action_projector(action)
-            z                   = self._current_latent[:,self._p:] # [B (1:T)*P D]
-            masks_e, masks_p    = build_masks(B=self._B, t=self._t, p=self._p, device=self._current_latent.device)
-            pred_z              = self._predictor(z, None, masks_e, masks_p, act)[0] # list{[B P D]}[0]
-        
-        self.latent_buffer[:,self._i:self._i+2] = self._current_latent[:,-2*self._p:].contiguous().view(self._B, 2, self._p, self.video_feature_dim) # [B i:i+1 P D]
-        self.action_buffer[:,self._i] = action
+        with torch.amp.autocast(device_type=self._current_latent.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
+            with torch.no_grad():
+                (act, _), _         = self._action_projector(action)
+                z                   = self._current_latent[:,self._p:] # [B (1:T)*P D]
+                masks_e, masks_p    = build_masks(B=self._B, t=self._t, p=self._p, device=self._current_latent.device)
+                pred_z              = self._predictor(z, None, masks_e, masks_p, act)[0] # list{[B P D]}[0]
+            
+            self.latent_buffer[:,self._i:self._i+2] = self._current_latent[:,-2*self._p:].contiguous().view(self._B, 2, self._p, self.video_feature_dim) # [B i:i+1 P D]
+            self.action_buffer[:,self._i] = action
 
-        self._current_latent = torch.concat([self._current_latent[:,self._p:], pred_z],dim=1)
-        self.target_latent = torch.concat([self.target_latent[:,self._p:], pred_z],dim=1)
-        pooled_z = self._state_pooler(self._current_latent[:,self._num_last_frames*self._p:,]).squeeze(1) 
-        
-        self.reward_hat_buffer[:,self._i] = self._reward_loss_fn.decode(self._rewards_decoder(pooled_z)).squeeze(-1) 
-        self.termination_hat_buffer[:,self._i] = (self._termin_decoder(pooled_z) > 0)
+            self._current_latent = torch.concat([self._current_latent[:,self._p:], pred_z],dim=1)
+            self.target_latent = torch.concat([self.target_latent[:,self._p:], pred_z],dim=1)
+            pooled_z = self._state_pooler(self._current_latent[:,self._num_last_frames*self._p:,]).squeeze(1) 
+            
+            self.reward_hat_buffer[:,self._i] = self._reward_loss_fn.decode(self._rewards_decoder(pooled_z)).squeeze(-1) 
+            self.termination_hat_buffer[:,self._i] = (self._termin_decoder(pooled_z) > 0)
 
         self._bump_index()
         return StateFeature(x=self.target_latent, t=self._t, p=self._p)
@@ -150,9 +151,10 @@ class WorldModel():
             self._t = T // self.tubelet_size
             self._p = (H // self.patch_size) * (W // self.patch_size)
             self._i = 0
-            self._init_buffer(imagination_batch_size, imagination_batch_length)
-            self._current_latent = self._context_encoder(sample_obs)
-            self.target_latent = self._target_encoder(sample_obs)
+            with torch.amp.autocast(device_type=sample_obs.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
+                self._init_buffer(imagination_batch_size, imagination_batch_length)
+                self._current_latent = self._context_encoder(sample_obs)
+                self.target_latent = self._target_encoder(sample_obs)
         return StateFeature(x=self.target_latent, t=self._t, p=self._p)
 
     def export(self, device):
@@ -188,10 +190,12 @@ class WorldModel():
                 self.termination_hat_buffer = torch.zeros(scalar_size, dtype=self._amp_dtype, device="cuda")
 
     def encode(self, sample_obs:torch.Tensor):
-        B, C, T, H, W = sample_obs.shape
-        t = T // self.tubelet_size
-        p = (H // self.patch_size) * (W // self.patch_size)
-        return StateFeature(x=self._target_encoder(sample_obs), t=t, p=p)
+        with torch.amp.autocast(device_type=sample_obs.device.type, dtype=self._amp_dtype, enabled=self._use_amp):
+            B, C, T, H, W = sample_obs.shape
+            t = T // self.tubelet_size
+            p = (H // self.patch_size) * (W // self.patch_size)
+            x = self._target_encoder(sample_obs)
+        return StateFeature(x=x, t=t, p=p)
     
     def train(self):
         for m in self.train_modules:
