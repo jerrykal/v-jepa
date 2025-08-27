@@ -38,7 +38,7 @@ def save_tensor_as_gif(
     """
     # Convert from tensor to numpy and scale to 0-255
     tensor_np = tensor.cpu().numpy()
-    tensor_np = (tensor_np * 255).astype(np.uint8)
+    tensor_np = (tensor_np * 255).clip(0, 255).astype(np.uint8)
 
     # Transpose from (C, T, H, W) to (T, H, W, C) for PIL
     tensor_np = tensor_np.transpose(1, 2, 3, 0)
