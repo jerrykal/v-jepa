@@ -11,3 +11,6 @@ decord
 pandas
 einops
 beartype
+tqdm
+tensorboardX
+gymnasium

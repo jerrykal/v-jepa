@@ -1,0 +1,31 @@
+# Text file
+*.md
+LICENSE
+
+# Experiments config files
+configs/RunExperiments/*
+experiments/*
+Experiments/*
+
+# Log files
+logs/*
+runs/*
+eval_result/*
+
+# ckpt
+ckpt/*
+
+# archive
+archive/*
+
+# vscode
+.vscode/*
+
+# Other
+*.swp
+*.swo
+__pycache__
+.DS_Store
+
+
+
