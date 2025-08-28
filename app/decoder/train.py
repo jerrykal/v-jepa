@@ -48,7 +48,7 @@ from app.decoder.utils import (
     load_checkpoint,
     load_jepa_encoder,
 )
-from app.vjepa.transforms import make_transforms
+from app.decoder.transforms import make_transforms
 
 # --
 log_timings = True

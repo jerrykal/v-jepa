@@ -5,6 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+# import warnings
+# warnings.filterwarnings('ignore')
+
 import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -17,43 +20,42 @@ try:
 except Exception:
     pass
 
-import copy
 import time
 import numpy as np
 
 import torch
-import torch.multiprocessing as mp
+from collections import deque
 import torch.nn.functional as F
-from einops import rearrange
-from torch.nn.parallel import DistributedDataParallel
+import torch.multiprocessing as mp
 
-from src.datasets.data_manager import init_data
-from src.masks.random_tube import MaskCollator as TubeMaskCollator
-from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
+# RL Training Environment
+from libs import env_factory
+
+from einops import rearrange
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed, AllReduce
 from src.utils.logging import (
-    CSVLogger,
     gpu_timer,
     get_logger,
-    grad_logger,
-    adamw_logger,
-    AverageMeter)
-from src.utils.tensors import repeat_interleave_batch
+    AverageMeter,
+    TensorboardLogger)
+from src.utils.tensors import normalize_tensor
+from src.utils.action_parser import ActionParser
+from app.world_model.ckpt_io import CheckpointIO
 
-from app.ac_jepa.utils import (
-    init_opt,
-    init_video_model,
-    init_latent_action_encoder,
-    load_checkpoint,
-    load_jepa_encoder,
+from app.world_model.utils import (
+    init_replay_buffer,
+    init_world_model,
+    init_agent
 )
-from app.vjepa.transforms import make_transforms
+
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 # --
 log_timings = True
-log_freq = 10
-checkpoint_freq = 1
+log_freq = 500
+checkpoint_freq = 1000
 # --
 
 _GLOBAL_SEED = 0
@@ -61,9 +63,9 @@ np.random.seed(_GLOBAL_SEED)
 torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
-
 logger = get_logger(__name__)
 
+IMAGE_CHANNEL = 3
 
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
@@ -73,11 +75,8 @@ def main(args, resume_preempt=False):
     # -- META
     cfgs_meta = args.get('meta')
     load_model = cfgs_meta.get('load_checkpoint') or resume_preempt
-    r_file = cfgs_meta.get('read_checkpoint', None)
+    ckpt_file = cfgs_meta.get('read_checkpoint', None)
     seed = cfgs_meta.get('seed', _GLOBAL_SEED)
-    save_every_freq = cfgs_meta.get('save_every_freq', -1)
-    skip_batches = cfgs_meta.get('skip_batches', -1)
-    use_sdpa = cfgs_meta.get('use_sdpa', False)
     which_dtype = cfgs_meta.get('dtype')
     logger.info(f'{which_dtype=}')
     if which_dtype.lower() == 'bfloat16':
@@ -89,80 +88,64 @@ def main(args, resume_preempt=False):
     else:
         dtype = torch.float32
         mixed_precision = False
-    pre_train_model = cfgs_meta.get('pre_train_model', None)
+    # pre_train_model = cfgs_meta.get('pre_train_model', None)
 
-    # -- MASK
-    cfgs_mask = args.get('mask')
+    # -- WORLD MODEL
+    cfgs_wm = args.get('world_model')
+    video_model_params = cfgs_wm["video_model_params"]
+    latent_action_enc_params = cfgs_wm["latent_action_enc_params"]
+    state_decoder_params = cfgs_wm["state_decoder_params"]
+    action_projector_params = cfgs_wm["action_projector_params"]
+    world_model_optimizer_params = cfgs_wm["optimizer_params"]
+    pretrained_model_path = cfgs_wm["pretrained_model_path"]
+    fine_tune = cfgs_wm["fine_tune"]
 
-    # -- MODEL
-    cfgs_model = args.get('model')
-    model_name = cfgs_model.get('model_name')
-    pred_depth = cfgs_model.get('pred_depth')
-    pred_embed_dim = cfgs_model.get('pred_embed_dim')
-    uniform_power = cfgs_model.get('uniform_power', True)
-    use_mask_tokens = cfgs_model.get('use_mask_tokens', True)
-    zero_init_mask_tokens = cfgs_model.get('zero_init_mask_tokens', True)
-    la_enc_num_heads = cfgs_model.get('latent_action_num_heads', 8)
-    dims_aciton_codebook = cfgs_model.get('dims_aciton_codebook', 10)
-    number_aciton_codebook = cfgs_model.get('number_aciton_codebook', 1)
-    lfq_bias = cfgs_model.get('lfq_bias', True)
-    lfq_commit_weight = cfgs_model.get('lfq_commit_weight', 0.25)
-    lfq_entropy_weight = cfgs_model.get('lfq_entropy_weight', 0.1)
-    lfq_diversity_weight = cfgs_model.get('lfq_diversity_weight', 1.0)
-    training_model_list = cfgs_model.get('training_model_list', ["encoder", "predictor", "latent_action_enc"])
-    action_adapter_type = cfgs_model.get('action_adapter_type', "None")
+    # -- AGENT
+    cfgs_agent = args.get('agent')
+    feat_len = cfgs_agent["feat_len"]
+    pooler_params = cfgs_agent["pooler_params"]
+    actor_params = cfgs_agent["actor_params"]
+    critic_params = cfgs_agent["critic_params"]
+    agent_optimizer_params = cfgs_wm["optimizer_params"]
+    gamma = cfgs_agent["gamma"]
+    lambd = cfgs_agent["lambd"]
+    entropy_coef = cfgs_agent["entropy_coef"]
 
-    # -- DATA
-    cfgs_data = args.get('data')
-    dataset_type = cfgs_data.get('dataset_type', 'videodataset')
-    mask_type = cfgs_data.get('mask_type', 'multiblock3d')
-    dataset_paths = cfgs_data.get('datasets', [])
-    datasets_weights = cfgs_data.get('datasets_weights', None)
-    if datasets_weights is not None:
-        assert len(datasets_weights) == len(dataset_paths), 'Must have one sampling weight specified for each dataset'
-    batch_size = cfgs_data.get('batch_size')
-    num_clips = cfgs_data.get('num_clips')
-    num_frames = cfgs_data.get('num_frames')
-    tubelet_size = cfgs_data.get('tubelet_size')
-    sampling_rate = cfgs_data.get('sampling_rate')
-    duration = cfgs_data.get('clip_duration', None)
-    crop_size = cfgs_data.get('crop_size', 224)
-    patch_size = cfgs_data.get('patch_size')
-    pin_mem = cfgs_data.get('pin_mem', False)
-    num_workers = cfgs_data.get('num_workers', 1)
-    filter_short_videos = cfgs_data.get('filter_short_videos', False)
-    decode_one_clip = cfgs_data.get('decode_one_clip', True)
-    log_resource_util_data = cfgs_data.get('log_resource_utilization', False)
+    # -- ENV
+    cfgs_env = args.get('env') 
+    maxpooling = cfgs_env["maxpooling"]
 
-    # -- DATA AUGS
-    cfgs_data_aug = args.get('data_aug')
-    ar_range = cfgs_data_aug.get('random_resize_aspect_ratio', [3/4, 4/3])
-    rr_scale = cfgs_data_aug.get('random_resize_scale', [0.3, 1.0])
-    motion_shift = cfgs_data_aug.get('motion_shift', False)
-    reprob = cfgs_data_aug.get('reprob', 0.)
-    use_aa = cfgs_data_aug.get('auto_augment', False)
-
-    # -- LOSS
-    cfgs_loss = args.get('loss')
-    loss_exp = cfgs_loss.get('loss_exp')
-    reg_coeff = cfgs_loss.get('reg_coeff')
-    quant_coeff = cfgs_loss.get('quant_coeff')
+    # -- REPALY BUFFER
+    cfgs_rb = args.get('replay_buffer')
+    max_length = cfgs_rb["max_length"]
+    warmup_length = cfgs_rb["warmup_length"]
+    store_on_gpu = cfgs_rb["store_on_gpu"]
+    export_data_path = cfgs_rb["export_data_path"]
+    pre_collected_data_path = cfgs_rb["pre_collected_data_path"]
 
     # -- OPTIMIZATION
     cfgs_opt = args.get('optimization')
-    ipe = cfgs_opt.get('ipe', None)
-    ipe_scale = cfgs_opt.get('ipe_scale', 1.0)
-    clip_grad = cfgs_opt.get('clip_grad', None)
-    wd = float(cfgs_opt.get('weight_decay'))
-    final_wd = float(cfgs_opt.get('final_weight_decay'))
-    num_epochs = cfgs_opt.get('epochs')
-    warmup = cfgs_opt.get('warmup')
-    start_lr = cfgs_opt.get('start_lr')
-    lr = cfgs_opt.get('lr')
-    final_lr = cfgs_opt.get('final_lr')
-    ema = cfgs_opt.get('ema')
-    betas = cfgs_opt.get('betas', (0.9, 0.999))
-    eps = cfgs_opt.get('eps', 1.e-8)
+    max_steps = cfgs_opt["max_steps"]
+    num_envs = cfgs_opt["num_envs"]
+    save_interval = cfgs_opt["save_interval"]
+
+    train_setting = cfgs_opt["train"]
+    batch_size = train_setting["batch_size"]
+    seq_length = train_setting["seq_length"]
+
+    demonstration_setting = cfgs_opt["demonstration"]
+    demon_enable = demonstration_setting["enabled"]
+    demon_batch_size = demonstration_setting["batch_size"]
+
+    imagination_setting = cfgs_opt["imagination"]
+    imagination_batch_size = imagination_setting["batch_size"]
+    imagination_seq_length = imagination_setting["seq_length"]
+    imagination_context_length = imagination_setting["context_length"]
+    imagination_demon_batch_size = imagination_setting["demo_batch_size"]
+
+    update_setting = cfgs_opt["update"]
+    world_model_interval = update_setting["world_model_interval"]
+    agent_interval = update_setting["agent_interval"]
 
     # -- LOGGING
     cfgs_logging = args.get('logging')
@@ -192,471 +175,321 @@ def main(args, resume_preempt=False):
         torch.cuda.set_device(device)
 
     # -- log/checkpointing paths
-    log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
+    # log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
     latest_file = f'{tag}-latest.pth.tar'
     latest_path = os.path.join(folder, latest_file)
     load_path = None
     if load_model:
-        load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+        load_path = os.path.join(folder, ckpt_file) if ckpt_file is not None else latest_path
         if not os.path.exists(load_path):
             load_path = None
             load_model = False
 
-    # -- make csv_logger
-    csv_logger = CSVLogger(
-        log_file,
-        ('%d', 'epoch'),
-        ('%d', 'itr'),
-        ('%.5f', 'loss'),
-        ('%.5f', 'loss-jepa'),
-        ('%.5f', 'loss-quant'),
-        ('%.5f', 'reg-loss'),
-        ('%.5f', 'enc-grad-norm'),
-        ('%.5f', 'pred-grad-norm'),
-        ('%.5f', 'la-grad-norm'),
-        ('%d', 'gpu-time(ms)'),
-        ('%d', 'wall-time(ms)'),
-    )
-
-    # -- init model
-    encoder, predictor = init_video_model(
-        uniform_power=uniform_power,
-        use_mask_tokens=use_mask_tokens,
-        num_mask_tokens=len(cfgs_mask),
-        zero_init_mask_tokens=zero_init_mask_tokens,
-        device=device,
-        patch_size=patch_size,
-        num_frames=num_frames,
-        tubelet_size=tubelet_size,
-        model_name=model_name,
-        crop_size=crop_size,
-        pred_depth=pred_depth,
-        pred_embed_dim=pred_embed_dim,
-        use_sdpa=use_sdpa,
-        adapter_type=action_adapter_type,
-        action_dim=dims_aciton_codebook
-    )
-    target_encoder = copy.deepcopy(encoder)
-
-
-    # -- init latnet action model
-    latent_action_enc = init_latent_action_encoder(
-        device=device,
-        inp_dims=encoder.backbone.embed_dim, 
-        num_heads=la_enc_num_heads,
-        d_codebook=dims_aciton_codebook,
-        n_codebook=number_aciton_codebook,
-        lfq_bias=lfq_bias,
-        lfq_commit_weight=lfq_commit_weight,
-        lfq_entropy_weight=lfq_entropy_weight,
-        lfq_diversity_weight=lfq_diversity_weight,
-    )
-
-    all_named_modules = {
-        'encoder': encoder,
-        'predictor': predictor,
-        'latent_action_enc': latent_action_enc,
-    }
-
-    # -- make data transforms
-    if mask_type == 'multiblock3d':
-        logger.info('Initializing basic multi-block mask')
-        mask_collator = MB3DMaskCollator(
-            crop_size=crop_size,
-            num_frames=num_frames,
-            patch_size=patch_size,
-            tubelet_size=tubelet_size,
-            cfgs_mask=cfgs_mask)
-    else:
-        logger.info('Initializing random tube mask')
-        mask_collator = TubeMaskCollator(
-            crop_size=crop_size,
-            num_frames=num_frames,
-            patch_size=patch_size,
-            tubelet_size=tubelet_size,
-            cfgs_mask=cfgs_mask)
-    transform = make_transforms(
-        random_horizontal_flip=True,
-        random_resize_aspect_ratio=ar_range,
-        random_resize_scale=rr_scale,
-        reprob=reprob,
-        auto_augment=use_aa,
-        motion_shift=motion_shift,
-        crop_size=crop_size)
-
-    # -- init data-loaders/samplers
-    (unsupervised_loader,
-     unsupervised_sampler) = init_data(
-         data=dataset_type,
-         root_path=dataset_paths,
-         batch_size=batch_size,
-         training=True,
-         clip_len=num_frames,
-         frame_sample_rate=sampling_rate,
-         filter_short_videos=filter_short_videos,
-         decode_one_clip=decode_one_clip,
-         duration=duration,
-         num_clips=num_clips,
-         transform=transform,
-         datasets_weights=datasets_weights,
-         collator=mask_collator,
-         num_workers=num_workers,
-         world_size=world_size,
-         pin_mem=pin_mem,
-         rank=rank,
-         log_dir=folder if log_resource_util_data else None)
-    try:
-        _dlen = len(unsupervised_loader)
-    except Exception:  # Different interface for webdataset
-        _dlen = unsupervised_loader.num_batches
-    if ipe is None:
-        ipe = _dlen
-    logger.info(f'iterations per epoch/dataest length: {ipe}/{_dlen}')
-
-    # -- init optimizer and scheduler
-    training_modules = [all_named_modules[name] for name in training_model_list if name in all_named_modules]
-    optimizer, scaler, scheduler, wd_scheduler = init_opt(
-        models=training_modules,
-        wd=wd,
-        final_wd=final_wd,
-        start_lr=start_lr,
-        ref_lr=lr,
-        final_lr=final_lr,
-        iterations_per_epoch=ipe,
-        warmup=warmup,
-        num_epochs=num_epochs,
-        ipe_scale=ipe_scale,
-        mixed_precision=mixed_precision,
-        betas=betas,
-        eps=eps)
-    predictor = DistributedDataParallel(predictor, static_graph=True)
-    latent_action_enc = DistributedDataParallel(latent_action_enc, static_graph=True)
-    encoder = DistributedDataParallel(encoder)
-    target_encoder = DistributedDataParallel(target_encoder)
-
-    if pre_train_model:
-        for p in encoder.parameters():
-            p.requires_grad = False
-    for p in target_encoder.parameters():
-        p.requires_grad = False
-
-    # -- momentum schedule
-    momentum_scheduler = (ema[0] + i*(ema[1]-ema[0])/(ipe*num_epochs*ipe_scale)
-                          for i in range(int(ipe*num_epochs*ipe_scale)+1))
-
-    start_epoch = 0
-    # -- load training checkpoint
-    if pre_train_model:
-        encoder, target_encoder, predictor = load_jepa_encoder(pre_train_model, encoder, target_encoder, predictor)
-
-    if load_model or os.path.exists(latest_path):
-        (
-            encoder,
-            predictor,
-            target_encoder,
-            latent_action_enc,
-            optimizer,
-            scaler,
-            start_epoch,
-        ) = load_checkpoint(
-            r_path=load_path,
-            encoder=encoder,
-            predictor=predictor,
-            target_encoder=target_encoder,
-            latent_action_enc=latent_action_enc,
-            opt=optimizer,
-            scaler=scaler)
-        for _ in range(start_epoch * ipe):
-            scheduler.step()
-            wd_scheduler.step()
-            next(momentum_scheduler)
-            mask_collator.step()
-
-    def save_checkpoint(epoch, path):
-        if rank != 0:
-            return
-        save_dict = {
-            'encoder': encoder.state_dict(),
-            'predictor': predictor.state_dict(),
-            'opt': optimizer.state_dict(),
-            'scaler': None if scaler is None else scaler.state_dict(),
-            'target_encoder': target_encoder.state_dict(),
-            'latent_action_encoder': latent_action_enc.state_dict(),
-            'epoch': epoch,
-            'loss': loss_meter.avg,
-            'batch_size': batch_size,
-            'world_size': world_size,
-            'lr': lr,
-        }
-        try:
-            torch.save(save_dict, path)
-        except Exception as e:
-            logger.info(f'Encountered exception when saving checkpoint: {e}')
-
+    # -- init logger
     logger.info('Initializing loader...')
-    loader = iter(unsupervised_loader)
+    tb_logger = TensorboardLogger(path=folder)
+    
+    ## -- meter of world model loss 
+    wm_total_loss_meter = AverageMeter()
+    wm_action_loss_meter = AverageMeter()
+    wm_reward_loss_meter = AverageMeter()
+    wm_termin_loss_meter = AverageMeter()
 
-    if skip_batches > 0:
-        logger.info(f'Skip {skip_batches} batches')
-        unsupervised_sampler.set_epoch(start_epoch)
-        for itr in range(skip_batches):
-            if itr % 10 == 0:
-                logger.info(f'Skip {itr}/{skip_batches} batches')
-            try:
-                udata = next(loader)
-            except Exception:
-                loader = iter(unsupervised_loader)
-                udata = next(loader)
+    ## -- meter of agent loss 
+    agent_total_loss_meter = AverageMeter()
+    agent_policy_loss_meter = AverageMeter()
+    agent_value_loss_meter = AverageMeter()
+    agent_entropy_loss_meter = AverageMeter()
 
-    # -- TRAINING LOOP
-    for epoch in range(start_epoch, num_epochs):
-        logger.info('Epoch %d' % (epoch + 1))
+    ## -- meter of time 
+    interactive_gpu_time_meter = AverageMeter()
+    wm_update_gpu_time_meter = AverageMeter()
+    agent_update_gpu_time_meter = AverageMeter()
+    interactive_wall_time_meter = AverageMeter()
+    wm_update_wall_time_meter = AverageMeter()
+    agent_update_wall_time_meter = AverageMeter()
 
-        # -- update distributed-data-loader epoch
-        unsupervised_sampler.set_epoch(epoch)
+    # -- init environment
+    frame_skip = video_model_params["tubelet_size"]  # Number of frames skipped per step; kept in sync with video encoder's tubelet size
+    vec_env = env_factory.build_single_env(
+        cfgs_env, frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
+    action_dims = list(vec_env.action_space.nvec)
+    ActionParser.init(action_dims)
 
-        loss_meter = AverageMeter()
-        input_var_meter = AverageMeter()
-        input_var_min_meter = AverageMeter()
-        jepa_loss_meter = AverageMeter()
-        quant_loss_meter = AverageMeter()
-        reg_loss_meter = AverageMeter()
-        mask_meters = [AverageMeter() for _ in range(len(cfgs_mask))]
-        gpu_time_meter = AverageMeter()
-        wall_time_meter = AverageMeter()
 
-        for itr in range(ipe):
-            itr_start_time = time.time()
+    # -- init replay buffer
+    image_size = cfgs_env["Environment"]["task_parameter"]["image_size"]
+    
+    replay_buffer = init_replay_buffer(
+        device=device,
+        obs_h=image_size[0], obs_w=image_size[1], obs_c=IMAGE_CHANNEL, 
+        action_dims=action_dims, 
+        num_envs=num_envs, 
+        max_length=max_length, 
+        warmup_length=warmup_length, 
+        frame_skip=frame_skip,
+        store_on_gpu=store_on_gpu,
+    )
 
-            try:
-                udata, masks_enc, masks_pred = next(loader)
-            except Exception:
-                logger.info('Exhausted data loaders. Refreshing...')
-                loader = iter(unsupervised_loader)
-                udata, masks_enc, masks_pred = next(loader)
-            assert len(masks_enc) == len(masks_pred), \
-                'Currently require num encoder masks = num predictor masks'
+    if demon_enable and export_data_path:
+        replay_buffer.load_trajectory(
+            path=export_data_path
+        )
+    
+    if pre_collected_data_path:
+        replay_buffer.load_buffer(
+            path=pre_collected_data_path
+        )
+    
+    # -- init world model
+    world_model = init_world_model(
+        device=device,
+        video_model_params=video_model_params,
+        latent_action_enc_params=latent_action_enc_params,
+        state_decoder_params=state_decoder_params,
+        action_projector_params=action_projector_params,
+        optimizer_params=world_model_optimizer_params,
+        tensorlogger=tb_logger,
+        action_dims=action_dims,
+        pretrained_model_path=pretrained_model_path,
+        fine_tune=fine_tune,
+        use_amp=mixed_precision,
+        amp_dtype=dtype
+    )
 
-            def load_clips():
-                # -- unsupervised video clips
-                # Put each clip on the GPU and concatenate along batch
-                # dimension
-                clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
+    # -- init Agent
+    agent = init_agent(
+        device=device,
+        pooler_params=pooler_params,
+        actor_params=actor_params,
+        critic_params=critic_params,
+        optimizer_params=agent_optimizer_params,
+        input_dim=world_model.video_feature_dim,
+        feat_len=feat_len,
+        action_dim=action_dims, 
+        gamma=gamma, lambd=lambd, 
+        entropy_coef=entropy_coef,
+        tensorlogger=tb_logger,
+        use_amp=mixed_precision,
+        amp_dtype=dtype
+    )
 
-                # Put each mask-enc/mask-pred pair on the GPU and reuse the
-                # same mask pair for each clip
-                _masks_enc, _masks_pred = [], []
-                for _me, _mp in zip(masks_enc, masks_pred):
-                    _me = _me.to(device, non_blocking=True)
-                    _mp = _mp.to(device, non_blocking=True)
-                    _me = repeat_interleave_batch(_me, batch_size, repeat=num_clips)
-                    _mp = repeat_interleave_batch(_mp, batch_size, repeat=num_clips)
-                    _masks_enc.append(_me)
-                    _masks_pred.append(_mp)
+    # -- load training checkpoint
+    if load_model and os.path.exists(latest_path):
+        CheckpointIO.load(world=world_model, agent=agent, path=latest_path)
 
-                return (clips, _masks_enc, _masks_pred)
-            clips, masks_enc, masks_pred = load_clips()
+    # -- init context qeue
+    num_frames = video_model_params["num_frames"]
+    context_obs = deque(maxlen=num_frames)
+    sum_reward = np.zeros(num_envs)
+    current_obs, current_info = vec_env.reset()
 
-            for _i, m in enumerate(mask_meters):
-                m.update(masks_enc[_i][0].size(-1))
+    logger.info("============================= [Training Start] =============================")
+    # -- Training loop
+    with logging_redirect_tqdm():
+        for total_steps in tqdm(range(max_steps//num_envs)):
+            
+            # >> training script
+            def interactive(_current_obs, _current_info, _sum_reward):
+                world_model.eval()
+                agent.eval()
+                for _obs in _current_info["all_obs"] :
+                    context_obs.append(normalize_tensor(rearrange(torch.Tensor(_obs.copy()).cuda(), "C H W -> 1 C 1 H W") / 255)) # [one env , len obs ,(obs)]
 
-            def train_step():
-                _new_lr = scheduler.step()
-                _new_wd = wd_scheduler.step()
-                # --
-
-                def forward_target(c):
-                    """
-                    Returns list of tensors of shape [B, N, D], one for each
-                    mask-pred.
-                    """
-                    with torch.no_grad():
-                        h = target_encoder(c)
-                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim  [B, N, D]
-                        # -- create targets (masked regions of h)
-                        masked_h = apply_masks(h, masks_pred, concat=False)
-                        return masked_h, [h]*len(masks_pred)
-                    
-                def forward_latent(h):
-                    # FIXME: only using on temporal training
-                    x = [rearrange(_h, "B (t p) D -> B t p D", t=num_frames//tubelet_size, p=(crop_size//patch_size)**2) for _h in h]
-                    results = latent_action_enc(x)
-                    act_list, loss_list = zip(*results)  
-                    return list(act_list), torch.stack(loss_list).mean()
-                
-                def forward_context(c, h, act):
-                    """
-                    Returns list of tensors of shape [B, N, D], one for each
-                    mask-pred.
-                    """
-                    z = encoder(c, masks_enc)
-                    z = predictor(z, h, masks_enc, masks_pred, act)
-                    return z
-
-                def loss_fn(z, h):
-                    loss = 0.
-                    # Compute loss and accumulate for each mask-enc/mask-pred pair
-                    for zi, hi in zip(z, h):
-                        loss += torch.mean(torch.abs(zi - hi)**loss_exp) / loss_exp
-                    loss /= len(masks_pred)
-                    return loss
-
-                def reg_fn(z):
-                    return sum([torch.sqrt(zi.var(dim=1) + 0.0001) for zi in z]) / len(z)
-
-                # Step 1. Forward
-                loss_jepa, loss_reg = 0., 0.
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    masked_h, h = forward_target(clips)
-                    act, loss_quant = forward_latent(h)
-                    z = forward_context(clips, masked_h, act)
-                    loss_jepa = loss_fn(z, masked_h)  # jepa prediction loss
-                    pstd_z = reg_fn(z)  # predictor variance across patches
-                    loss_reg += torch.mean(F.relu(1.-pstd_z))
-                loss = loss_jepa + reg_coeff * loss_reg + loss_quant * quant_coeff
-
-                # Step 2. Backward & step
-                _enc_norm, _pred_norm, _la_norm = 0., 0., 0.
-                if mixed_precision:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                else:
-                    loss.backward()
-                if (epoch > warmup) and (clip_grad is not None):
-                    _enc_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
-                    _pred_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
-                    _la_norm = torch.nn.utils.clip_grad_norm_(latent_action_enc.parameters(), clip_grad)
-                if mixed_precision:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                grad_stats = grad_logger(encoder.named_parameters())
-                grad_stats.global_norm = float(_enc_norm)
-                grad_stats_pred = grad_logger(predictor.named_parameters())
-                grad_stats_pred.global_norm = float(_pred_norm)
-                grad_stats_la_enc = grad_logger(predictor.named_parameters())
-                grad_stats_la_enc.global_norm = float(_la_norm)
-                optimizer.zero_grad()
-                optim_stats = adamw_logger(optimizer)
-
-                # Step 3. momentum update of target encoder
-                m = next(momentum_scheduler)
                 with torch.no_grad():
-                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+                    if len(context_obs) != num_frames:
+                        action = vec_env.action_space.sample()
+                    else:
+                        context_latent = world_model.encode(torch.cat(list(context_obs), dim=2))
+                        action = agent.sample_as_env_action(
+                            context_latent, greedy=False
+                        )
+                        action = np.squeeze(action)
+                obs, reward, done, truncated, info = vec_env.step(action)
 
-                return (
-                    float(loss),
-                    float(loss_jepa),
-                    float(loss_quant),
-                    float(loss_reg),
-                    _new_lr,
-                    _new_wd,
-                    grad_stats,
-                    grad_stats_pred,
-                    grad_stats_la_enc,
-                    optim_stats,
+                for _obs in _current_info["all_obs"] :
+                    replay_buffer.append(_obs, action, reward, done) # obs_t, act_t, reward_{t+1}, done_{t+1}
+                _sum_reward += reward
+
+                truncated = np.array([truncated])
+                done = np.array([done])
+                done_flag = np.logical_or(done, truncated)
+                if done_flag.any() :
+                    for i in range(num_envs):
+                        if done_flag:
+                            tb_logger.log(f"Env/reward", _sum_reward[i],type='scalar')
+                            tb_logger.log(f"Env/episode_steps", info["elapsed_steps"]//4,type='scalar')
+                            tb_logger.log("Replay_buffer/length", len(replay_buffer),type='scalar')
+                            _sum_reward[i] = 0
+                            context_obs.clear()
+                            obs, info = vec_env.reset()
+                return obs, info, _sum_reward
+
+            def world_model_train_step():
+                world_model.train()
+                agent.eval()
+
+                obs, action, reward, termination  = replay_buffer.sample(
+                    batch_size=batch_size, external_batch_size=demon_batch_size, batch_length=seq_length, to_device=device
                 )
-            (loss, loss_jepa, loss_quant, loss_reg, _new_lr, _new_wd, grad_stats, grad_stats_pred, grad_stats_la_enc, optim_stats,), gpu_etime_ms = gpu_timer(train_step)
-            iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.
-            loss_meter.update(loss)
-            input_var = float(AllReduce.apply(clips.view(clips.shape[0], -1).var(dim=1).mean(dim=0)))
-            input_var_min = float(AllReduce.apply(torch.min(clips.view(clips.shape[0], -1).var(dim=1))))
-            input_var_meter.update(input_var)
-            input_var_min_meter.update(input_var_min)
-            jepa_loss_meter.update(loss_jepa)
-            quant_loss_meter.update(loss_quant)
-            reg_loss_meter.update(loss_reg)
-            gpu_time_meter.update(gpu_etime_ms)
-            wall_time_meter.update(iter_elapsed_time_ms)
+                return world_model.update(
+                    sample_obs=obs, sample_action=action,
+                    sample_rewards=reward, sample_termin=termination,
+                )
+                
 
-            # -- Logging
-            def log_stats():
-                csv_logger.log(
-                    epoch + 1,
-                    itr,
-                    loss,
-                    loss_jepa,
-                    loss_quant,
-                    loss_reg,
-                    grad_stats.global_norm,
-                    grad_stats_pred.global_norm,
-                    grad_stats_la_enc.global_norm,
-                    gpu_etime_ms,
-                    iter_elapsed_time_ms)
-                if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+            def agent_train_step():
+                world_model.eval()
+                agent.train()
+                obs, action, _, _  = replay_buffer.sample(
+                    batch_size=imagination_batch_size, 
+                    external_batch_size=imagination_demon_batch_size, 
+                    batch_length=imagination_context_length, to_device=device
+                )
+                with torch.no_grad():
+                    context_latent = world_model.reset(
+                        sample_obs=obs, imagination_batch_size=imagination_batch_size, imagination_batch_length=imagination_seq_length)
+                    for i in range(imagination_seq_length):
+                        action = agent.sample(context_latent)
+                        context_latent = world_model.step(action)
+                    feature, actions, rewards, terminations = world_model.export(device)
+
+                return agent.update(
+                    feature=feature,
+                    action=actions,
+                    old_logprob=None, # not use
+                    old_value=None, # not use
+                    reward=rewards,
+                    termination=terminations,
+                )
+
+                
+            # >> Training flow
+            # >> World model and Agent interactive with Env
+            step_start_time = time.time()
+            (current_obs, current_info, sum_reward), interactive_gpu_etime_ms= gpu_timer(
+                interactive, True, _current_obs=current_obs, _current_info=current_info, _sum_reward=sum_reward)
+            interactive_wall_time_meter.update((time.time() - step_start_time) * 1000.)
+            interactive_gpu_time_meter.update(interactive_gpu_etime_ms)
+            if (total_steps % log_freq == 0):
+                logger.info(
+                    f"(interactive)[{total_steps}] "
+                    f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
+                    f"[gpu_time: {interactive_gpu_time_meter.avg:.1f} ms]"
+                    f"[wall_time: {interactive_wall_time_meter.avg:.1f} ms]"
+                )
+
+            # >> World model training
+            if replay_buffer.ready() and total_steps % (world_model_interval//num_envs) == 0:
+                step_start_time = time.time()
+                (world_model_debug_data), world_model_train_gpu_etime_ms= gpu_timer(world_model_train_step)
+                wm_update_wall_time_meter.update((time.time() - step_start_time) * 1000.)
+                wm_update_gpu_time_meter.update(world_model_train_gpu_etime_ms)
+
+                # >> World model Logging data
+                total_loss = world_model_debug_data["loss"]["total"]
+                action_loss = world_model_debug_data["loss"]["action"]
+                reward_loss = world_model_debug_data["loss"]["reward"]
+                termin_loss = world_model_debug_data["loss"]["termin"]
+
+                optim_stats = world_model_debug_data["optim_stats"]
+                new_lr = world_model_debug_data["lr"]
+                new_wd = world_model_debug_data["wd"]
+
+                wm_total_loss_meter.update(total_loss)
+                wm_action_loss_meter.update(action_loss)
+                wm_reward_loss_meter.update(reward_loss)
+                wm_termin_loss_meter.update(termin_loss)
+                
+                # >> TB logger
+                # TODO: Decoder decode JEPA feature or somtthing need record data
+
+                # >> Print
+                if (total_steps % log_freq == 0) or np.isnan(total_loss) or np.isinf(total_loss):
                     logger.info(
-                        '[%d, %5d] loss: %.3f | p:%.3f q:%.3f r:%.3f | '
-                        'input_var: %.3f %.3f | '
-                        'masks: %s '
-                        '[wd: %.2e] [lr: %.2e] '
-                        '[mem: %.2e] '
-                        '[gpu: %.1f ms]'
-                        '[wall: %.1f ms]'
-                        % (epoch + 1, itr,
-                           loss_meter.avg,
-                           jepa_loss_meter.avg,
-                           quant_loss_meter.avg,
-                           reg_loss_meter.avg,
-                           input_var_meter.avg,
-                           input_var_min_meter.avg,
-                           '[' + ', '.join(['%.1f' % m.avg for m in mask_meters]) + ']',
-                           _new_wd,
-                           _new_lr,
-                           torch.cuda.max_memory_allocated() / 1024.0**2,
-                           gpu_time_meter.avg,
-                           wall_time_meter.avg))
+                        f"(world_model_train_step)[{total_steps}] "
+                        f"loss: {wm_total_loss_meter.avg:.3f} | "
+                        f"act:{wm_action_loss_meter.avg:.3f} rew:{wm_reward_loss_meter.avg:.3f} ter:{wm_termin_loss_meter.avg:.3f} | "
+                        f"[wd: {new_wd:.2e}] [lr: {new_lr:.2e}] "
+                        f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
+                        f"[gpu_time: {wm_update_gpu_time_meter.avg:.1f} ms]"
+                        f"[wall_time: {wm_update_wall_time_meter.avg:.1f} ms]"
+                    )
 
                     if optim_stats is not None:
                         logger.info(
-                            '[%d, %5d] first moment: %.2e [%.2e %.2e] second moment: %.2e [%.2e %.2e]'
-                            % (epoch + 1, itr,
-                               optim_stats.get('exp_avg').avg,
-                               optim_stats.get('exp_avg').min,
-                               optim_stats.get('exp_avg').max,
-                               optim_stats.get('exp_avg_sq').avg,
-                               optim_stats.get('exp_avg_sq').min,
-                               optim_stats.get('exp_avg_sq').max))
+                            f"(world_model_train_step)[{total_steps}] "
+                            f"first moment: {optim_stats.get('exp_avg').avg:.2e} [{optim_stats.get('exp_avg').min:2e} {optim_stats.get('exp_avg').max:2e}] "
+                            f"second moment: {optim_stats.get('exp_avg_sq').avg:2e} [{optim_stats.get('exp_avg_sq').min:2e} {optim_stats.get('exp_avg_sq').max:2e}]")
 
-                    if grad_stats is not None:
-                        logger.info(
-                            '[%d, %5d] enc_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
-                            % (epoch + 1, itr,
-                               grad_stats.first_layer,
-                               grad_stats.last_layer,
-                               grad_stats.min,
-                               grad_stats.max,
-                               grad_stats.global_norm))
 
-                    if grad_stats_pred is not None:
-                        logger.info(
-                            '[%d, %5d] pred_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
-                            % (epoch + 1, itr,
-                               grad_stats_pred.first_layer,
-                               grad_stats_pred.last_layer,
-                               grad_stats_pred.min,
-                               grad_stats_pred.max,
-                               grad_stats_pred.global_norm))
-                               
-                    if grad_stats_la_enc is not None:
-                        logger.info(
-                            '[%d, %5d] la_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e'
-                            % (epoch + 1, itr,
-                               grad_stats_la_enc.first_layer,
-                               grad_stats_la_enc.last_layer,
-                               grad_stats_la_enc.min,
-                               grad_stats_la_enc.max,
-                               grad_stats_la_enc.global_norm))
-            log_stats()
-            assert not np.isnan(loss), 'loss is nan'
+                    for name, value in world_model_debug_data["train_model_state"].items():
+                        logger.info(f"(world_model_train_step)[{total_steps}] "
+                                    f"[{name}]: f/l[{value.first_layer:2e} {value.last_layer:2e}] "
+                                    f"mn/mx({value.min:2e}, {value.max:2e}) {value.global_norm:2e}")
+                
+                    assert not np.isnan(total_loss), 'loss is nan'
 
-        # -- Save Checkpoint
-        logger.info('avg. loss %.3f' % loss_meter.avg)
-        # -- Save Last
-        if epoch % checkpoint_freq == 0 or epoch == (num_epochs - 1):
-            save_checkpoint(epoch + 1, latest_path)
-            if save_every_freq > 0 and epoch % save_every_freq == 0:
-                save_every_file = f'{tag}-e{epoch}.pth.tar'
+            # >> Agent training
+            if replay_buffer.ready() and total_steps % (agent_interval//num_envs) == 0:
+                step_start_time = time.time()
+                (agent_debug_data), agent_train_gpu_etime_ms= gpu_timer(agent_train_step)
+                agent_update_wall_time_meter.update((time.time() - step_start_time) * 1000.)
+                agent_update_gpu_time_meter.update(agent_train_gpu_etime_ms)
+
+                # >> Agent Logging data
+                total_loss = agent_debug_data["loss"]["total"]
+                policy_loss = agent_debug_data["loss"]["policy"]
+                value_loss = agent_debug_data["loss"]["value"]
+                entropy_loss = agent_debug_data["loss"]["entropy"]
+
+                optim_stats = agent_debug_data["optim_stats"]
+                new_lr = agent_debug_data["lr"]
+                new_wd = agent_debug_data["wd"]
+
+                agent_total_loss_meter.update(total_loss)
+                agent_policy_loss_meter.update(policy_loss)
+                agent_value_loss_meter.update(value_loss)
+                agent_entropy_loss_meter.update(entropy_loss)
+                
+                # >> Print
+                if (total_steps % log_freq == 0) or np.isnan(total_loss) or np.isinf(total_loss):
+                    logger.info(
+                        f"(agent_train_step)[{total_steps}] "
+                        f"loss: {agent_total_loss_meter.avg:.3f} | "
+                        f"policy:{agent_policy_loss_meter.avg:.3f} value:{agent_value_loss_meter.avg:.3f} entropy:{agent_entropy_loss_meter.avg:.3f} | "
+                        f"[wd: {new_wd:.2e}] [lr: {new_lr:.2e}] "
+                        f"[mem: {torch.cuda.max_memory_allocated()/1024.0**2:.2e}] "
+                        f"[gpu_time: {agent_update_gpu_time_meter.avg:.1f} ms]"
+                        f"[wall_time: {agent_update_wall_time_meter.avg:.1f} ms]"
+                    )
+
+                    if optim_stats is not None:
+                        logger.info(
+                            f"(agent_train_step)[{total_steps}] "
+                            f"first moment: {optim_stats.get('exp_avg').avg:.2e} [{optim_stats.get('exp_avg').min:2e} {optim_stats.get('exp_avg').max:2e}] "
+                            f"second moment: {optim_stats.get('exp_avg_sq').avg:2e} [{optim_stats.get('exp_avg_sq').min:2e} {optim_stats.get('exp_avg_sq').max:2e}]")
+
+
+                    for name, value in agent_debug_data["train_model_state"].items():
+                        logger.info(f"(agent_train_step)[{total_steps}] "
+                                    f"[{name}]: f/l[{value.first_layer:2e} {value.last_layer:2e}] "
+                                    f"mn/mx({value.min:2e}, {value.max:2e}) {value.global_norm:2e}")
+                
+                    assert not np.isnan(total_loss), 'loss is nan'
+
+            # >> Checkpoint save
+            if total_steps % checkpoint_freq == 0:
+                CheckpointIO.save(
+                world=world_model, agent=agent,
+                path=latest_path, logger=logger)
+            if save_interval > 0 and total_steps % save_interval == 0:
+                save_every_file = f'{tag}-step{total_steps}.pth.tar'
                 save_every_path = os.path.join(folder, save_every_file)
-                save_checkpoint(epoch + 1, save_every_path)
+                CheckpointIO.save(
+                    world=world_model, agent=agent,
+                    path=save_every_path, logger=logger)
+            
+
+    logger.info("Training Done!!!!!!1")
+

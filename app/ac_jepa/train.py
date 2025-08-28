@@ -48,7 +48,7 @@ from app.ac_jepa.utils import (
     load_checkpoint,
     load_jepa_encoder,
 )
-from app.vjepa.transforms import make_transforms
+from app.ac_jepa.transforms import make_transforms
 
 # --
 log_timings = True
@@ -478,7 +478,6 @@ def main(args, resume_preempt=False):
                         return masked_h, [h]*len(masks_pred)
                     
                 def forward_latent(h):
-                    # FIXME: only using on temporal training
                     x = [rearrange(_h, "B (t p) D -> B t p D", t=num_frames//tubelet_size, p=(crop_size//patch_size)**2) for _h in h]
                     results = latent_action_enc(x)
                     act_list, loss_list = zip(*results)  

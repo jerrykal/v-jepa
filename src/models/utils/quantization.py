@@ -11,6 +11,7 @@ from einops import pack, unpack
 import torch.nn.functional as F
 
 from typing import Tuple
+from abc import ABC, abstractmethod
 
 
 def entropy(p: Tensor, eps: float = 1e-6) -> Tensor:
@@ -27,8 +28,89 @@ def entropy(p: Tensor, eps: float = 1e-6) -> Tensor:
     return -(p * log(p.clamp(min=eps))).sum(dim=-1)
 
 
+class IQuantization(nn.Module, ABC):
+    """
+    Abstract base class for all quantization modules.
+
+    This interface defines the structure of a quantizer that:
+    - projects input into a codebook space,
+    - performs quantization (typically via nearest-neighbor or sign-based logic),
+    - returns discrete indices and quantized vectors,
+    - optionally computes training losses (e.g., commitment, entropy).
+
+    Subclasses should implement encode, quantize, decode, and forward.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @abstractmethod
+    def quantize(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Quantizes the encoded input tensor.
+
+        Args:
+            x (Tensor): Encoded tensor in the quantization (codebook) space.
+
+        Returns:
+            Tuple[Tensor, Tensor]:
+                - quantized vector (same shape as x),
+                - codebook indices for each input vector (discrete representation).
+        """
+        pass
+
+    @abstractmethod
+    def encode(self, x: Tensor) -> Tensor:
+        """
+        Projects the raw input into the quantization space (before quantization).
+
+        Args:
+            x (Tensor): Raw input tensor of shape [B, D_in].
+
+        Returns:
+            Tensor: Encoded tensor of shape [B, D_q], where D_q = codebook_dim * num_codebooks.
+        """
+        pass
+
+    @abstractmethod
+    def decode(self, idx: Tensor) -> Tensor:
+        """
+        Decodes the codebook indices back into reconstructed vectors (in input space).
+
+        Args:
+            idx (Tensor): Codebook indices of shape [B] or [B, C] depending on codebook setup.
+
+        Returns:
+            Tensor: Reconstructed vectors of shape [B, D_in], same as original input.
+        """
+        pass
+
+
+    @abstractmethod
+    def forward(self, x: Tensor) -> Tuple[Tuple[Tensor, Tensor], Tensor | None]:
+        """
+        Full quantization forward pass including optional training loss computation.
+
+        Typical flow:
+            1. Encode the input into the codebook space.
+            2. Quantize the encoded tensor to get discrete representation and quantized vector.
+            3. Decode the quantized vector back to input space.
+            4. If training: compute and return quantization loss (e.g., commitment, entropy).
+               Else: return only reconstruction and indices.
+
+        Args:
+            x (Tensor): Raw input tensor [B, D_in].
+
+        Returns:
+            Tuple:
+                - (reconstructed_tensor, indices): Reconstructed version of input and code indices.
+                - loss (or None if not training)
+        """
+        pass
+
+        
+
 # Simplified version of the myscience implementation at: https://github.com/myscience/open-genie
-class LookupFreeQuantization(nn.Module):
+class LookupFreeQuantization(IQuantization):
     """
     Lookup-Free Quantization module as originally introduced
     in the paper "Language Model Beats Diffusion: Tokenizer
@@ -46,6 +128,7 @@ class LookupFreeQuantization(nn.Module):
         diversity_weight: float = 1.0,
     ) -> None:
         super().__init__()
+        raise "not convert to IQuantization based"
         codebook_size = (2**codebook_dim) * num_codebook
         project = input_dim != codebook_dim * num_codebook
 
@@ -135,7 +218,7 @@ class LookupFreeQuantization(nn.Module):
 
 
 # Pytorch implementation of the official implementation at: https://github.com/google-deepmind/sonnet/blob/v1/sonnet/python/modules/nets/vqvae.py
-class VectorQuantization(nn.Module):
+class VectorQuantization(IQuantization):
     """
     Vector Quantization module as originally introduced in the paper "Neural Discrete Representation Learning"
     by van den Oord et al. (2017).
@@ -150,6 +233,7 @@ class VectorQuantization(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.input_dim = input_dim
         self._embedding_dim = embedding_dim
         self._num_embeddings = num_embeddings
         self._commitment_cost = commitment_cost
@@ -167,45 +251,43 @@ class VectorQuantization(nn.Module):
 
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
         self.codebook.weight.data.uniform_(-1.0 / embedding_dim, 1.0 / embedding_dim)
-
+        
+    def encode(self, x: Tensor) -> Tensor:
+        return self.in_proj(x)
+    
+    def quantize(self, encoded: Tensor) -> Tuple[Tensor, Tensor]:
+        flat = encoded.view(-1, self._embedding_dim)
+        # compute distances
+        d2 = (
+            flat.pow(2).sum(dim=1, keepdim=True)
+            - 2 * flat @ self.codebook.weight.t()
+            + self.codebook.weight.pow(2).sum(dim=1)
+        )
+        idx_flat = torch.argmin(d2, dim=1)
+        idxs = idx_flat.view(encoded.shape[:-1])
+        quantized = self.codebook(idx_flat).view_as(encoded)
+        return quantized, idxs
+    
+    def decode(self, idx: Tensor) -> Tensor:
+        quant = self.codebook(idx)
+        return self.out_proj(quant)
+    
     def forward(
         self,
         inputs: Tensor,
-        transpose: bool = False,
     ) -> tuple[tuple[Tensor, Tensor], Tensor | None]:
         # Project the inputs to the codebook space
-        inputs = self.in_proj(inputs)
-
-        input_shape = inputs.shape
-        flat_inputs = inputs.view(-1, self._embedding_dim)
-
-        # Calculate distances
-        # (x - y)^2 = x^2 - 2xy + y^2
-        distances = (
-            (torch.sum(flat_inputs**2, dim=1, keepdim=True))
-            - 2 * torch.matmul(flat_inputs, self.codebook.weight.T)
-            + torch.sum(self.codebook.weight.T**2, dim=0, keepdim=True)
-        )
-
-        # Get the closest codebook index for each input
-        encoding_indices = torch.argmin(distances, dim=1)
-
-        # Reshape encoding_indices to match input dimensions except the last one
-        encoding_indices = encoding_indices.view(input_shape[:-1])
-
-        # Quantize the input based on the encoding indices
-        quantized = self.codebook(encoding_indices)
-
-        # Project the quantized values back to the input space
+        encoded = self.in_proj(inputs)
+        quantized, idxs = self.quantize(encoded)
         outputs = self.out_proj(quantized)
 
         # No need to compute the loss if we are not training
         if not self.training:
-            return (outputs, encoding_indices), None
+            return (outputs, idxs), None
 
         # Vector quantization loss
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
+        e_latent_loss = F.mse_loss(quantized.detach(), encoded)
+        q_latent_loss = F.mse_loss(quantized, encoded.detach())
         loss = q_latent_loss + self._commitment_cost * e_latent_loss
 
-        return (outputs, encoding_indices), loss
+        return (outputs, idxs), loss

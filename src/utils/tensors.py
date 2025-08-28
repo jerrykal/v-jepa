@@ -8,11 +8,39 @@
 import math
 
 import torch
+from torchvision import transforms
 
 from logging import getLogger
 
 logger = getLogger()
 
+_normalize = transforms.Normalize(
+    mean=(0.485, 0.456, 0.406),
+    std=(0.229, 0.224, 0.225)
+)
+
+def normalize_tensor(x: torch.Tensor) -> torch.Tensor:
+    """
+    Normalize a batch of video tensors to match ImageNet convention.
+
+    Args:
+        x: Tensor with shape [B, C, T, H, W], values in [0,255] or [0,1].
+
+    Returns:
+        Normalized tensor with same shape [B, C, T, H, W].
+    """
+    if not torch.is_floating_point(x):
+        x = x.float()
+
+    if x.max() > 1.5:
+        x = x / 255.0
+
+    B, C, T, H, W = x.shape
+    x = x.permute(0, 2, 1, 3, 4).reshape(B*T, C, H, W)  # [B*T, C, H, W]
+    x = _normalize(x)
+    x = x.reshape(B, T, C, H, W).permute(0, 2, 1, 3, 4) 
+
+    return x
 
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW

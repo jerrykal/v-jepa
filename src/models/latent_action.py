@@ -31,19 +31,19 @@ class LatentActionEncoder(nn.Module):
         self,
         num_heads: int,
         d_codebook: int,
-        inp_dims: int = 192, 
+        input_dims: int = 192, 
         n_codebook: int = 1,
-        lfq_bias: bool = True,
-        lfq_commit_weight: float = 0.25,
-        lfq_entropy_weight: float = 0.1,
-        lfq_diversity_weight: float = 1.,
+        vq_bias: bool = True,
+        vq_commit_weight: float = 0.25,
+        vq_entropy_weight: float = 0.1,
+        vq_diversity_weight: float = 1.,
         quant_loss_weight: float = 1.,
     ) -> None:   
         super().__init__()
 
         self.enc_layer = nn.ModuleList([
             SpatialAttention(
-                dims=inp_dims,
+                dims=input_dims,
                 num_heads=num_heads,
                 qkv_bias=False,
                 qk_scale=None,
@@ -51,7 +51,7 @@ class LatentActionEncoder(nn.Module):
                 attn_drop=0.
             ),
             TemporalAttention(
-                dims=inp_dims,
+                dims=input_dims,
                 num_heads=num_heads,
                 qkv_bias=False,
                 qk_scale=None,
@@ -60,9 +60,9 @@ class LatentActionEncoder(nn.Module):
             )
         ])
         
-        self.attenion_pooler = AttentivePooler(
+        self.attention_pooler = AttentivePooler(
             num_queries=1,
-            embed_dim=inp_dims,
+            embed_dim=input_dims,
             num_heads=num_heads,
             mlp_ratio=4.0,
             depth=2,
@@ -83,21 +83,21 @@ class LatentActionEncoder(nn.Module):
         # )
 
         # Build the quantization module
-        # TODO: Refactor the parameters to match vector quantization instead of lookup-free quantization, e.g. change lfq_commit_weight to vq_commit_weight
+        # TODO: Refactor the parameters to match vector quantization instead of lookup-free quantization, e.g. change vq_commit_weight to vq_commit_weight
         # self.quant = LookupFreeQuantization(
-        #     input_dim           = inp_dims,
+        #     input_dim           = input_dims,
         #     codebook_dim        = d_codebook,
         #     num_codebook        = n_codebook,
-        #     use_bias            = lfq_bias,
-        #     commit_weight       = lfq_commit_weight,
-        #     entropy_weight      = lfq_entropy_weight,
-        #     diversity_weight    = lfq_diversity_weight,
+        #     use_bias            = vq_bias,
+        #     commit_weight       = vq_commit_weight,
+        #     entropy_weight      = vq_entropy_weight,
+        #     diversity_weight    = vq_diversity_weight,
         # )
         self.quant = VectorQuantization(
             embedding_dim=d_codebook,
-            input_dim=inp_dims,
+            input_dim=input_dims,
             num_embeddings=n_codebook,
-            commitment_cost=lfq_commit_weight,
+            commitment_cost=vq_commit_weight,
         )
         
         self.d_codebook = d_codebook
@@ -123,12 +123,16 @@ class LatentActionEncoder(nn.Module):
         x = x.permute(0, 2, 1, 3).reshape(B, T * P, D)
 
         # === 3. Apply Attentive Pooler: [B, T*P, D] → [B, 1, D]
-        pooled = self.attenion_pooler(x)  # returns [B, 1, D]
+        pooled = self.attention_pooler(x)  # returns [B, 1, D]
         pooled = pooled.squeeze(1)        # [B, D]
 
         # === 4. Quantize
         (z_q, idx), q_loss = self.quant(pooled)  # z_q: [B, D_q]
-
+        
+        # === End point for eval
+        if not self.training:
+            return z_q, 0.0
+        
         # === 5. Output and loss
         loss = q_loss * self.quant_loss_weight if self.training and q_loss is not None else 0
         
