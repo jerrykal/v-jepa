@@ -9,7 +9,7 @@ import logging
 import sys
 
 import torch
-from diffusers import DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers.optimization import get_scheduler
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
@@ -53,6 +53,17 @@ def load_jepa_encoder(
         logger.info(f"Failed to load JEPA encoder: {e}")
 
     return encoder
+
+
+def get_pretrained_vae(
+    model_id: str,
+    device: torch.device,
+):
+    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+    vae.to(device)
+    logger.info(f"Loaded VAE from {model_id}")
+
+    return vae
 
 
 def load_checkpoint(

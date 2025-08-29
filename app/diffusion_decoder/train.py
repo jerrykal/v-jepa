@@ -15,13 +15,14 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.nn.parallel import DistributedDataParallel
 
+from app.diffusion_decoder.transforms import denormalize_clips, make_transforms
 from app.diffusion_decoder.utils import (
+    get_pretrained_vae,
     init_models,
     init_opt,
     load_checkpoint,
     load_jepa_encoder,
 )
-from app.vjepa.transforms import make_transforms
 from src.datasets.data_manager import init_data
 from src.utils.distributed import AllReduce, init_distributed
 from src.utils.logging import (
@@ -92,9 +93,9 @@ def main(args, resume_preempt=False):
 
     # -- DIFFUSION
     cfgs_diffusion = args.get("diffusion")
-    sample_size = cfgs_diffusion.get("sample_size", 224)
     in_channels = cfgs_diffusion.get("in_channels", 3)
     out_channels = cfgs_diffusion.get("out_channels", 3)
+    sample_size = cfgs_diffusion.get("sample_size", 64)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
     block_out_channels = cfgs_diffusion.get("block_out_channels", (64, 128, 256, 512))
     down_block_types = cfgs_diffusion.get(
@@ -122,6 +123,11 @@ def main(args, resume_preempt=False):
     )
     scheduler_prediction_type = cfgs_diffusion.get(
         "scheduler_prediction_type", "epsilon"
+    )
+    do_latent_diffusion = cfgs_diffusion.get("do_latent_diffusion", False)
+    vae_model_id = cfgs_diffusion.get("vae_model_id", None)
+    assert not do_latent_diffusion or vae_model_id is not None, (
+        "VAE model must be provided if latent diffusion is enabled"
     )
 
     # -- DATA
@@ -224,13 +230,11 @@ def main(args, resume_preempt=False):
         num_frames=num_frames,
         tubelet_size=tubelet_size,
         model_name=model_name,
-        # NOTE: crop_size are the size of the input to the encoder,
-        #       sample_size are the size of the input to the decoder.
         crop_size=crop_size,
-        sample_size=sample_size,
         use_sdpa=use_sdpa,
         in_channels=in_channels,
         out_channels=out_channels,
+        sample_size=sample_size,
         layers_per_block=layers_per_block,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
@@ -299,13 +303,18 @@ def main(args, resume_preempt=False):
 
     # -- freeze encoder
     for p in encoder.parameters():
-        p.requires_grad = False
+        p.requires_grad_(False)
 
     start_epoch = 0
 
     # -- load pre-trained encoder
     assert pre_train_model is not None, "Pre-trained encoder must be provided"
     encoder = load_jepa_encoder(pre_train_model, encoder)
+
+    # -- load pre-trained vae
+    if do_latent_diffusion:
+        vae = get_pretrained_vae(vae_model_id, device)
+        vae.requires_grad_(False)
 
     # -- load training checkpoint
     if load_model:
@@ -388,7 +397,7 @@ def main(args, resume_preempt=False):
 
             # -- unsupervised video clips
             # Put each clip on the GPU and concatenate along batch
-            # dimension, resulting in (B, C, L, H, W)
+            # dimension, resulting in (B, C, F, H, W)
             clips = torch.cat(
                 [u.to(device, non_blocking=True) for u in udata[0]], dim=0
             )
@@ -409,39 +418,41 @@ def main(args, resume_preempt=False):
                         num_frames, dim=0
                     )
 
-                    clean_images = clips.clone()
-                    clean_images = rearrange(clean_images, "b c f h w -> (b f) c h w")
-                    if crop_size != sample_size:
-                        clean_images = F.interpolate(
-                            clean_images, size=sample_size, mode="bilinear"
-                        )
+                    # Denormalize clips to range [0, 1] & reshape to a larger batch of images
+                    images = denormalize_clips(clips.clone())
+                    images = rearrange(images, "b c f h w -> (b f) c h w")
 
-                    # Sample noise that we'll add to the images
-                    noise = torch.randn_like(clean_images, dtype=dtype, device=device)
+                    # Normalize clips to range (-1, 1)
+                    images = images * 2.0 - 1.0
 
-                    # NOTE: The batch size here is different from the batch size of the data loader.
-                    #       The precise batch size here is batch_size * num_frames.
-                    bsz = clean_images.shape[0]
+                    # Convert images to latent space if a VAE encoder is provided
+                    if do_latent_diffusion:
+                        latents = vae.encode(images).latent_dist.sample()
+                        latents = latents * vae.config.scaling_factor
+                    else:
+                        latents = images
+
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents, device=device)
 
                     # Sample a random timestep for each image
                     timesteps = torch.randint(
                         0,
                         noise_scheduler.config.num_train_timesteps,
-                        (bsz,),
+                        (latents.shape[0],),
                         device=device,
                     ).long()
 
                     # Create class labels indicating which frame we are reconstructing
                     class_labels = torch.arange(num_frames, device=device)
+                    class_labels = class_labels.repeat(batch_size)
 
-                    # Add noise to the clean images
-                    noisy_images = noise_scheduler.add_noise(
-                        clean_images, noise, timesteps
-                    )
+                    # Add noise to the clean latents
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                     # Get the model prediction
                     noise_pred = unet(
-                        noisy_images,
+                        noisy_latents,
                         timesteps,
                         encoder_hidden_states,
                         class_labels,
@@ -451,9 +462,7 @@ def main(args, resume_preempt=False):
                     if noise_scheduler.config.prediction_type == "epsilon":
                         target = noise
                     elif noise_scheduler.config.prediction_type == "v_prediction":
-                        target = noise_scheduler.get_velocity(
-                            clean_images, noise, timesteps
-                        )
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
                     else:
                         raise ValueError(
                             f"Unsupported prediction type: {noise_scheduler.config.prediction_type}"
