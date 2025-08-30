@@ -15,24 +15,18 @@ from tqdm import tqdm
 
 import src.datasets.utils.video.transforms as video_transforms
 import src.datasets.utils.video.volume_transforms as volume_transforms
-from app.diffusion_decoder.utils import init_models, load_checkpoint, load_jepa_encoder
+from app.diffusion_decoder.transforms import denormalize_clips
+from app.diffusion_decoder.utils import (
+    get_pretrained_vae,
+    init_models,
+    load_checkpoint,
+    load_jepa_encoder,
+)
 from src.datasets.data_manager import init_data
 from src.models.diffusion_decoder import JEPADecoderPipeline
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def unnormalize_tensor(tensor, mean, std):
-    tensor = tensor.clone().contiguous()
-    mean = mean.to(tensor.device)
-    std = std.to(tensor.device)
-
-    C, T, H, W = tensor.shape
-    tensor = tensor.view(C, -1).permute(1, 0)
-    tensor.mul_(std).add_(mean)
-    tensor = tensor.permute(1, 0).view(C, T, H, W)
-    return tensor
 
 
 def save_tensor_as_gif(tensor, output_path, duration=100):
@@ -95,9 +89,9 @@ def main() -> None:
 
     # -- DIFFUSION
     cfgs_diffusion = configs.get("diffusion")
-    sample_size = cfgs_diffusion.get("sample_size", 224)
-    in_channels = cfgs_diffusion.get("in_channels", 3)
-    out_channels = cfgs_diffusion.get("out_channels", 3)
+    sample_size = cfgs_diffusion.get("sample_size", 64)
+    in_channels = cfgs_diffusion.get("in_channels", 4)
+    out_channels = cfgs_diffusion.get("out_channels", 4)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
     block_out_channels = cfgs_diffusion.get("block_out_channels", (64, 128, 256, 256))
     down_block_types = cfgs_diffusion.get(
@@ -126,6 +120,8 @@ def main() -> None:
     scheduler_prediction_type = cfgs_diffusion.get(
         "scheduler_prediction_type", "epsilon"
     )
+    do_latent_diffusion = cfgs_diffusion.get("do_latent_diffusion", False)
+    vae_model_id = cfgs_diffusion.get("vae_model_id", "openai/clip-vit-large-patch14")
 
     # -- DATA
     cfgs_data = configs.get("data")
@@ -204,10 +200,10 @@ def main() -> None:
         tubelet_size=tubelet_size,
         model_name=model_name,
         crop_size=crop_size,
-        sample_size=sample_size,
         use_sdpa=use_sdpa,
         in_channels=in_channels,
         out_channels=out_channels,
+        sample_size=sample_size,
         layers_per_block=layers_per_block,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
@@ -222,6 +218,12 @@ def main() -> None:
     # Load encoder weight
     encoder = load_jepa_encoder(pre_train_model, encoder)
 
+    # Load VAE weight
+    if do_latent_diffusion:
+        vae = get_pretrained_vae(vae_model_id, device)
+        vae.eval()
+        logger.info("Loaded VAE")
+
     # Load denoising UNet weight
     if r_file is not None:
         unet, noise_scheduler, _, _, _ = load_checkpoint(
@@ -231,7 +233,9 @@ def main() -> None:
         )
 
     # Create diffusion pipeline
-    pipeline = JEPADecoderPipeline(unet=unet, scheduler=noise_scheduler)
+    pipeline = JEPADecoderPipeline(
+        unet=unet, scheduler=noise_scheduler, vae=vae, img_size=crop_size
+    )
     pipeline = pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     logger.info("Created diffusion pipeline")
@@ -266,24 +270,18 @@ def main() -> None:
                 generator=torch.Generator(device=device).manual_seed(seed),
             )
 
+        clips = denormalize_clips(clips)
         clips = rearrange(clips, "b c f h w -> (b f) c h w")
-        if crop_size != sample_size:
-            clips = F.interpolate(clips, size=sample_size, mode="bilinear")
 
         # Rearrange both clips and reconstructed images to be (C, F, H, W)
         clips = clips.permute(1, 0, 2, 3)
         reconstructed_images = reconstructed_images.permute(1, 0, 2, 3)
 
-        # Unnormalize the clips and reconstructed images for visualization
-        clips_unnormalized = unnormalize_tensor(clips, normalize_mean, normalize_std)
-        reconstructed_unnormalized = unnormalize_tensor(
-            reconstructed_images, normalize_mean, normalize_std
-        )
+        # Denormalize the reconstructed images for visualization
+        reconstructed = (reconstructed_images * 0.5 + 0.5).clamp(0, 1)
 
         # Save both original and reconstructed images side by side
-        combined_images = torch.cat(
-            [clips_unnormalized, reconstructed_unnormalized], dim=3
-        )
+        combined_images = torch.cat([clips, reconstructed], dim=3)
         save_tensor_as_gif(
             combined_images,
             os.path.join(folder, f"{i:02d}.gif"),
