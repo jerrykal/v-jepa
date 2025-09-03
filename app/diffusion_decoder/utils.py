@@ -159,6 +159,7 @@ def init_models(
     scheduler_beta_end: float = 0.012,
     scheduler_beta_schedule: str = "scaled_linear",
     scheduler_prediction_type: str = "epsilon",
+    cross_attn_cond: bool = True,
 ) -> tuple[torch.nn.Module, torch.nn.Module, DDIMScheduler]:
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -179,7 +180,7 @@ def init_models(
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
-        cross_attention_dim=encoder.backbone.embed_dim,
+        cross_attention_dim=encoder.backbone.embed_dim if cross_attn_cond else None,
         num_class_embeds=num_frames,
         scheduler_beta_start=scheduler_beta_start,
         scheduler_beta_end=scheduler_beta_end,

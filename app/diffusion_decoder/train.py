@@ -131,6 +131,7 @@ def main(args, resume_preempt=False):
     assert not do_latent_diffusion or vae_model_id is not None, (
         "VAE model must be provided if latent diffusion is enabled"
     )
+    cross_attn_cond = cfgs_diffusion.get("cross_attn_cond", True)
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -245,6 +246,7 @@ def main(args, resume_preempt=False):
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
+        cross_attn_cond=cross_attn_cond,
     )
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
