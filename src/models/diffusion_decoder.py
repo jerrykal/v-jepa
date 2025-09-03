@@ -1,5 +1,5 @@
 import torch
-from diffusers import PNDMScheduler, UNet2DConditionModel
+from diffusers import AutoencoderKL, PNDMScheduler, UNet2DConditionModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
 
@@ -8,10 +8,13 @@ class JEPADecoderPipeline(DiffusionPipeline):
         self,
         unet: UNet2DConditionModel,
         scheduler: PNDMScheduler,
+        vae: AutoencoderKL | None = None,
+        img_size: int = 224,
     ):
         super().__init__()
 
-        self.register_modules(unet=unet, scheduler=scheduler)
+        self.img_size = img_size
+        self.register_modules(unet=unet, scheduler=scheduler, vae=vae)
 
     @torch.no_grad()
     def __call__(
@@ -26,41 +29,48 @@ class JEPADecoderPipeline(DiffusionPipeline):
         timesteps = self.scheduler.timesteps
 
         # Prepare noisy image
-        image_shape = (
+        downsample_factor = self.vae.config.sample_size // self.unet.config.sample_size
+        latents_shape = (
             1,
-            3,
-            self.unet.config.sample_size,
-            self.unet.config.sample_size,
+            self.unet.config.in_channels,
+            self.img_size // downsample_factor,
+            self.img_size // downsample_factor,
         )
-        noisy_images = torch.randn(
-            image_shape,
+        latents = torch.randn(
+            latents_shape,
             generator=generator,
             device=self._execution_device,
             dtype=encoder_hidden_states.dtype,
         )
 
         # Repeat the noise so that each image in the clip is denoised from the same noise
-        noisy_images = noisy_images.repeat(encoder_hidden_states.shape[0], 1, 1, 1)
+        latents = latents.repeat(encoder_hidden_states.shape[0], 1, 1, 1)
 
         # Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for t in timesteps:
-                model_input = self.scheduler.scale_model_input(noisy_images, t)
+                latent_model_input = self.scheduler.scale_model_input(latents, t)
 
                 noise_pred = self.unet(
-                    model_input,
+                    latent_model_input,
                     timestep=t,
                     encoder_hidden_states=encoder_hidden_states,
                     class_labels=class_labels,
                     return_dict=False,
                 )[0]
-                noisy_images = self.scheduler.step(
-                    noise_pred, t, noisy_images, return_dict=False
+                latents = self.scheduler.step(
+                    noise_pred, t, latents, return_dict=False
                 )[0]
 
                 progress_bar.update()
 
-        generated_images = noisy_images
+        if self.vae is not None:
+            generated_images = self.vae.decode(
+                latents / self.vae.config.scaling_factor, return_dict=True
+            )[0]
+        else:
+            generated_images = latents
+
         return generated_images
 
 
