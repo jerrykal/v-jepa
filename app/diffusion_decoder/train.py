@@ -93,16 +93,18 @@ def main(args, resume_preempt=False):
 
     # -- DIFFUSION
     cfgs_diffusion = args.get("diffusion")
-    in_channels = cfgs_diffusion.get("in_channels", 3)
-    out_channels = cfgs_diffusion.get("out_channels", 3)
+    in_channels = cfgs_diffusion.get("in_channels", 4)
+    out_channels = cfgs_diffusion.get("out_channels", 4)
     sample_size = cfgs_diffusion.get("sample_size", 64)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
-    block_out_channels = cfgs_diffusion.get("block_out_channels", (64, 128, 256, 512))
+    block_out_channels = cfgs_diffusion.get(
+        "block_out_channels", (320, 640, 1280, 1280)
+    )
     down_block_types = cfgs_diffusion.get(
         "down_block_types",
         (
-            "DownBlock2D",
-            "DownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
             "CrossAttnDownBlock2D",
             "DownBlock2D",
         ),
@@ -112,8 +114,8 @@ def main(args, resume_preempt=False):
         (
             "UpBlock2D",
             "CrossAttnUpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D",
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
         ),
     )
     scheduler_beta_start = cfgs_diffusion.get("scheduler_beta_start", 0.00085)
@@ -124,7 +126,7 @@ def main(args, resume_preempt=False):
     scheduler_prediction_type = cfgs_diffusion.get(
         "scheduler_prediction_type", "epsilon"
     )
-    do_latent_diffusion = cfgs_diffusion.get("do_latent_diffusion", False)
+    do_latent_diffusion = cfgs_diffusion.get("do_latent_diffusion", True)
     vae_model_id = cfgs_diffusion.get("vae_model_id", None)
     assert not do_latent_diffusion or vae_model_id is not None, (
         "VAE model must be provided if latent diffusion is enabled"
