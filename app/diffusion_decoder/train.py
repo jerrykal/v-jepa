@@ -132,6 +132,7 @@ def main(args, resume_preempt=False):
         "VAE model must be provided if latent diffusion is enabled"
     )
     cross_attn_cond = cfgs_diffusion.get("cross_attn_cond", True)
+    in_concat_cond = cfgs_diffusion.get("in_concat_cond", False)
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -247,6 +248,7 @@ def main(args, resume_preempt=False):
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
         cross_attn_cond=cross_attn_cond,
+        in_concat_cond=in_concat_cond,
     )
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -289,7 +291,7 @@ def main(args, resume_preempt=False):
         _dlen = unsupervised_loader.num_batches
     if ipe is None:
         ipe = _dlen
-    logger.info(f"iterations per epoch/dataest length: {ipe}/{_dlen}")
+    logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
 
     # -- init optimizer and scheduler
     optimizer, scaler, lr_scheduler = init_opt(
@@ -313,22 +315,19 @@ def main(args, resume_preempt=False):
 
     # -- load pre-trained encoder
     assert pre_train_model is not None, "Pre-trained encoder must be provided"
-    encoder = load_jepa_encoder(pre_train_model, encoder)
+    load_jepa_encoder(pre_train_model, encoder)
 
     # -- load pre-trained vae
     if do_latent_diffusion:
         vae = get_pretrained_vae(vae_model_id, device)
         vae.requires_grad_(False)
 
+        # The factor by which the image size is downsampled by the VAE
+        vae_downsample_factor = vae.config.sample_size // unet.config.sample_size
+
     # -- load training checkpoint
     if load_model:
-        (
-            unet,
-            noise_scheduler,
-            optimizer,
-            scaler,
-            start_epoch,
-        ) = load_checkpoint(
+        epoch = load_checkpoint(
             r_path=load_path,
             unet=unet,
             noise_scheduler=noise_scheduler,
@@ -412,15 +411,13 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                    encoder_hidden_states = encoder(clips)
-                    encoder_hidden_states = F.layer_norm(
-                        encoder_hidden_states, (encoder_hidden_states.size(-1),)
+                    jepa_features = encoder(clips)
+                    jepa_features = F.layer_norm(
+                        jepa_features, (jepa_features.size(-1),)
                     )
 
                     # (B, L, D) -> (B * num_frames, L, D), L is the number of patches, D is the embedding dimension
-                    encoder_hidden_states = encoder_hidden_states.repeat_interleave(
-                        num_frames, dim=0
-                    )
+                    jepa_features = jepa_features.repeat_interleave(num_frames, dim=0)
 
                     # Denormalize clips to range [0, 1] & reshape to a larger batch of images
                     images = denormalize_clips(clips.clone())
@@ -431,6 +428,16 @@ def main(args, resume_preempt=False):
 
                     # Convert images to latent space if a VAE encoder is provided
                     if do_latent_diffusion:
+                        # Extrapolate the image size to make sure the latent's shape matches UNet's sample size
+                        images = F.interpolate(
+                            images,
+                            size=(
+                                sample_size * vae_downsample_factor,
+                                sample_size * vae_downsample_factor,
+                            ),
+                            mode="bilinear",
+                        )
+
                         latents = vae.encode(images).latent_dist.sample()
                         latents = latents * vae.config.scaling_factor
                     else:
@@ -454,14 +461,35 @@ def main(args, resume_preempt=False):
                     # Add noise to the clean latents
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
+                    # Concatenate JEPA features with diffusion latent
+                    if in_concat_cond:
+                        jepa_cond = jepa_features.clone()
+                        jepa_cond = rearrange(
+                            jepa_cond,
+                            "b (t p1 p2) d -> b (t d) p1 p2",
+                            p1=crop_size // patch_size,
+                            p2=crop_size // patch_size,
+                        )
+                        jepa_cond = F.interpolate(
+                            jepa_cond,
+                            size=(noisy_latents.shape[2], noisy_latents.shape[3]),
+                            mode="bilinear",
+                        )
+                        noisy_latents = torch.cat([jepa_cond, noisy_latents], dim=1)
+
                     # Get the model prediction
-                    noise_pred = unet(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states,
-                        class_labels,
-                        return_dict=False,
-                    )[0]
+                    if cross_attn_cond:
+                        noise_pred = unet(
+                            noisy_latents,
+                            timesteps,
+                            jepa_features,
+                            class_labels,
+                            return_dict=False,
+                        )[0]
+                    else:
+                        noise_pred = unet(
+                            noisy_latents, timesteps, class_labels, return_dict=False
+                        )[0]
 
                     if noise_scheduler.config.prediction_type == "epsilon":
                         target = noise
