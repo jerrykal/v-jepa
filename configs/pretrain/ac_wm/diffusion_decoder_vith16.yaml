@@ -1,0 +1,86 @@
+app: diffusion_decoder
+nodes: 16
+tasks_per_node: 8
+
+data:
+  dataset_type: VideoDataset
+  datasets:
+    - data/CLIP4MC_Dataset/train.csv
+  decode_one_clip: true #not using
+  batch_size: 1
+  num_clips: 1
+  num_frames: 16
+  tubelet_size: 2
+  sampling_rate: 4
+  crop_size: 224
+  patch_size: 16
+  pin_mem: true
+  num_workers: 4
+  filter_short_videos: false
+  clip_duration: null
+
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+
+logging:
+  folder: logs/train/diffusion_decoder_vith16
+  write_tag: diffusion_decoder
+
+meta:
+  load_checkpoint: false
+  read_checkpoint: null
+  seed: 234
+  use_sdpa: true
+  dtype: bfloat16
+  pre_train_model: weights/vith16.pth.tar
+  gradient_checkpointing: true
+
+model:
+  model_name: vit_huge
+  uniform_power: true
+
+diffusion:
+  in_channels: 3
+  out_channels: 3
+  layers_per_block: 2
+  block_out_channels:
+    - 64
+    - 128
+    - 256
+    - 512
+  down_block_types:
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "CrossAttnDownBlock2D"
+    - "DownBlock2D"
+  up_block_types:
+    - "UpBlock2D"
+    - "CrossAttnUpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+  scheduler_beta_start: 0.00085
+  scheduler_beta_end: 0.012
+  scheduler_beta_schedule: "scaled_linear"
+  scheduler_prediction_type: "epsilon"
+
+
+optimization:
+  ipe: 300
+  lr_scheduler_type: constant
+  lr: 2.0e-5
+  clip_grad: 1.0
+  epochs: 300
+  warmup: 10
+  betas:
+    - 0.9
+    - 0.999
+  weight_decay: 1.0e-2
+  eps: 1.0e-8

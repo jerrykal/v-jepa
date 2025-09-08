@@ -3,6 +3,8 @@
 logs/*
 runs/*
 ckpt/*
+data/*
+weights/*
 experiments/*
 *.log
 *.pkl
