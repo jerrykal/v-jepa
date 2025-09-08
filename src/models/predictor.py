@@ -33,7 +33,7 @@ class ConcatAdapter(ActionAdapter):
     def forward(self, x, action):
         B, N, D = x.shape
         action_exp = action.unsqueeze(1).expand(-1, 1, -1)     # [B, 1, D]
-        return torch.cat([x, action_exp], dim=1)               # [B, N+1, D]
+        return torch.cat([x, action_exp], dim=1)               # [B, N+1, D]x
     
 class VisionTransformerPredictor(nn.Module):
     """ Vision Transformer """
@@ -62,7 +62,9 @@ class VisionTransformerPredictor(nn.Module):
     ):
         super().__init__()
         # Map input to predictor dimension
-        self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+        self.predictor_context_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+        self.predictor_action_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+
 
         # Action input adapter
         self.action_adapter_type = kwargs.get("adapter_type", "None")
@@ -214,8 +216,8 @@ class VisionTransformerPredictor(nn.Module):
         B = len(ctxt) // len(masks_ctxt)
 
         # Map context tokens to pedictor dimensions
-        x = self.predictor_embed(ctxt)
-        act = self.predictor_embed(act)
+        x = self.predictor_context_embed(ctxt)
+        act = self.predictor_action_embed(act)
         
         _, N_ctxt, D = x.shape
         # Add positional embedding to ctxt tokens
