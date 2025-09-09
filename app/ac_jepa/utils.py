@@ -139,21 +139,20 @@ def init_latent_action_encoder(
     num_heads: int = 8,
     d_codebook: int = 10,
     n_codebook: int = 1,
-    lfq_bias: bool = True,
-    lfq_commit_weight: float = 0.25,
-    lfq_entropy_weight: float = 0.1,
-    lfq_diversity_weight: float = 1.,
+    vq_bias: bool = True,
+    vq_commit_weight: float = 0.25,
+    vq_entropy_weight: float = 0.1,
+    vq_diversity_weight: float = 1.,
     ):
     la_enc = LatentActionEncoder(
-        inp_dims=inp_dims, 
+        input_dims=inp_dims, 
         num_heads=num_heads,
         d_codebook=d_codebook,
         n_codebook=n_codebook,
-        lfq_bias=lfq_bias,
-        lfq_commit_weight=lfq_commit_weight,
-        lfq_entropy_weight=lfq_entropy_weight,
-        lfq_diversity_weight=lfq_diversity_weight,
-        quant_loss_weight=1.0,
+        vq_bias=vq_bias,
+        vq_commit_weight=vq_commit_weight,
+        vq_entropy_weight=vq_entropy_weight,
+        vq_diversity_weight=vq_diversity_weight,
     )
     la_enc = LatentActionEncoderMultiMaskWrapper(la_enc)
     

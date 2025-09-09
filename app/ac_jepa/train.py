@@ -105,10 +105,10 @@ def main(args, resume_preempt=False):
     la_enc_num_heads = cfgs_model.get('latent_action_num_heads', 8)
     dims_aciton_codebook = cfgs_model.get('dims_aciton_codebook', 10)
     number_aciton_codebook = cfgs_model.get('number_aciton_codebook', 1)
-    lfq_bias = cfgs_model.get('lfq_bias', True)
-    lfq_commit_weight = cfgs_model.get('lfq_commit_weight', 0.25)
-    lfq_entropy_weight = cfgs_model.get('lfq_entropy_weight', 0.1)
-    lfq_diversity_weight = cfgs_model.get('lfq_diversity_weight', 1.0)
+    vq_bias = cfgs_model.get('vq_bias', True)
+    vq_commit_weight = cfgs_model.get('vq_commit_weight', 0.25)
+    vq_entropy_weight = cfgs_model.get('vq_entropy_weight', 0.1)
+    vq_diversity_weight = cfgs_model.get('vq_diversity_weight', 1.0)
     training_model_list = cfgs_model.get('training_model_list', ["encoder", "predictor", "latent_action_enc"])
     action_adapter_type = cfgs_model.get('action_adapter_type', "None")
 
@@ -246,10 +246,10 @@ def main(args, resume_preempt=False):
         num_heads=la_enc_num_heads,
         d_codebook=dims_aciton_codebook,
         n_codebook=number_aciton_codebook,
-        lfq_bias=lfq_bias,
-        lfq_commit_weight=lfq_commit_weight,
-        lfq_entropy_weight=lfq_entropy_weight,
-        lfq_diversity_weight=lfq_diversity_weight,
+        vq_bias=vq_bias,
+        vq_commit_weight=vq_commit_weight,
+        vq_entropy_weight=vq_entropy_weight,
+        vq_diversity_weight=vq_diversity_weight,
     )
 
     all_named_modules = {
