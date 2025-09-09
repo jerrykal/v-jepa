@@ -3,7 +3,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import torch
 import torch.nn as nn
-from libs.env_factory import build_single_env
+from libs.environment_factory import build_single_env
 from app.world_model.utils import init_world_model, init_replay_buffer
 from src.utils.action_parser import ActionParser
 

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 import torch.multiprocessing as mp
 
 # RL Training Environment
-from libs import env_factory
+from libs import environment_factory
 
 from einops import rearrange
 from src.masks.utils import apply_masks
@@ -211,7 +211,7 @@ def main(args, resume_preempt=False):
 
     # -- init environment
     frame_skip = video_model_params["tubelet_size"]  # Number of frames skipped per step; kept in sync with video encoder's tubelet size
-    vec_env = env_factory.build_single_env(
+    vec_env = environment_factory.build_single_env(
         cfgs_env, frame_skip=frame_skip, maxpooling=maxpooling) # TODO multiple env
     action_dims = list(vec_env.action_space.nvec)
     ActionParser.init(action_dims)

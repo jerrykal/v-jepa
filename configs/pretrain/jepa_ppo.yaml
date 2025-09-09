@@ -1,0 +1,60 @@
+app: ppo
+nodes: 16
+tasks_per_node: 8
+
+Environment:
+  task: CombatSpider
+  task_parameter:
+    image_size:
+    - 224
+    - 224
+    step_penalty: 0
+    attack_reward: 1
+    success_reward: 10
+  num_envs: 1
+  seed: 123
+  action_space: ReducedActionSpace
+  observation: ImageObservation
+  frame_stack: 4
+
+ppo_training:
+  save_name: "1M_JEPA_HarvestWool"
+  training_step: 1000000
+  eval_episode: 10
+
+  policy_network:
+    gamma: 0.985
+    gea_lambda: 0.95    
+    entropy_coef: 3e-4
+
+
+  policy:
+    features_extractor:
+      kwargs:
+        features_dim: 1024
+        model_name: "vit_large"           
+        pretrain_path: "/media/cgv/1tb_disk/EmboodiedAgent/v-jepa/vitl16.pth.tar" 
+        crop_size: 224
+        patch_size: 16
+        num_frames: 16
+        tubelet_size: 2
+        uniform_power: false
+        use_sdpa: true
+        pooler_params:
+          num_heads: 8
+          mlp_ratio: 2
+          depth: 2
+          init_std: 0.02
+          qkv_bias: true
+          complete_block: true
+
+    net_kwargs:
+      hid_dim: 1024
+      num_layers: 3
+      activation: "silu"
+      norm: "rmsnorm"
+      share_backbone: false
+
+logging:
+  folder: "logs/ppo/test"               # Folder for logs
+  write_tag: "wm"               # Logging tag
