@@ -7,7 +7,7 @@ data:
   datasets:
     - data/CLIP4MC_Dataset/train.csv
   decode_one_clip: true #not using
-  batch_size: 1
+  batch_size: 4
   num_clips: 1
   num_frames: 16
   tubelet_size: 2
@@ -42,6 +42,7 @@ meta:
   dtype: bfloat16
   pre_train_model: weights/vitl16.pth.tar
   gradient_checkpointing: true
+  save_every_freq: 50
 
 model:
   model_name: vit_large
@@ -50,30 +51,31 @@ model:
 diffusion:
   in_channels: 4
   out_channels: 4
-  sample_size: 64
-  layers_per_block: 2
+  sample_size: 32
+  layers_per_block: 4
+  attention_head_dim: 64
+  dropout: 0.1
   block_out_channels:
-    - 320
-    - 640
-    - 1280
-    - 1280
+    - 128
+    - 256
+    - 512
+    - 512
   down_block_types:
     - "CrossAttnDownBlock2D"
     - "CrossAttnDownBlock2D"
     - "CrossAttnDownBlock2D"
-    - "DownBlock2D"
+    - "CrossAttnDownBlock2D"
   up_block_types:
-    - "UpBlock2D"
     - "CrossAttnUpBlock2D"
     - "CrossAttnUpBlock2D"
     - "CrossAttnUpBlock2D"
-  scheduler_beta_start: 0.00085
-  scheduler_beta_end: 0.012
-  scheduler_beta_schedule: "scaled_linear"
-  scheduler_prediction_type: "epsilon"
+    - "CrossAttnUpBlock2D"
+  scheduler_prediction_type: "v_prediction"
   do_latent_diffusion: true
-  vae_model_id: stable-diffusion-v1-5/stable-diffusion-v1-5
+  do_edm_style_training: true
+  vae_model_id: stabilityai/stable-diffusion-xl-base-1.0
   cross_attn_cond: true
+  in_concat_cond: false
 
 
 optimization:
@@ -81,7 +83,7 @@ optimization:
   lr_scheduler_type: constant
   lr: 2.0e-5
   clip_grad: 1.0
-  epochs: 300
+  epochs: 150
   warmup: 10
   betas:
     - 0.9

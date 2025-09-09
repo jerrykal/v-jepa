@@ -10,7 +10,7 @@ import sys
 
 import torch
 import torch.nn as nn
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, EDMEulerScheduler
 from diffusers.optimization import get_scheduler
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
@@ -130,6 +130,8 @@ def init_models(
     in_channels: int = 3,
     out_channels: int = 3,
     layers_per_block: int = 2,
+    attention_head_dim: int = 8,
+    dropout: float = 0.0,
     block_out_channels: tuple[int, ...] = (128, 256, 512, 512),
     down_block_types: tuple[str, ...] = (
         "CrossAttnDownBlock2D",
@@ -149,7 +151,8 @@ def init_models(
     scheduler_prediction_type: str = "epsilon",
     cross_attn_cond: bool = True,
     in_concat_cond: bool = False,
-) -> tuple[nn.Module, nn.Module, DDIMScheduler]:
+    do_edm_style_training: bool = False,
+) -> tuple[nn.Module, nn.Module, DDIMScheduler | EDMEulerScheduler]:
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
@@ -172,6 +175,8 @@ def init_models(
         in_channels=in_channels,
         out_channels=out_channels,
         layers_per_block=layers_per_block,
+        attention_head_dim=attention_head_dim,
+        dropout=dropout,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
@@ -181,6 +186,7 @@ def init_models(
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
+        do_edm_style_training=do_edm_style_training,
     )
 
     def init_weights(m):

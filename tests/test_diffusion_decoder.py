@@ -127,6 +127,8 @@ def main() -> None:
     assert not do_latent_diffusion or vae_model_id is not None, (
         "VAE model must be provided if latent diffusion is enabled"
     )
+    cross_attn_cond = cfgs_diffusion.get("cross_attn_cond", True)
+    in_concat_cond = cfgs_diffusion.get("in_concat_cond", False)
 
     # -- DATA
     cfgs_data = configs.get("data")
@@ -217,11 +219,13 @@ def main() -> None:
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
+        cross_attn_cond=cross_attn_cond,
+        in_concat_cond=in_concat_cond,
     )
     logger.info("Initialized models")
 
     # Load encoder weight
-    encoder = load_jepa_encoder(pre_train_model, encoder)
+    load_jepa_encoder(pre_train_model, encoder)
 
     # Load VAE weight
     if do_latent_diffusion:
@@ -231,7 +235,7 @@ def main() -> None:
 
     # Load denoising UNet weight
     if r_file is not None:
-        unet, noise_scheduler, _, _, _ = load_checkpoint(
+        load_checkpoint(
             r_path=r_file,
             unet=unet,
             noise_scheduler=noise_scheduler,
@@ -239,7 +243,13 @@ def main() -> None:
 
     # Create diffusion pipeline
     pipeline = JEPADecoderPipeline(
-        unet=unet, scheduler=noise_scheduler, vae=vae, img_size=crop_size
+        unet=unet,
+        scheduler=noise_scheduler,
+        vae=vae,
+        img_size=crop_size,
+        patch_size=patch_size,
+        cross_attn_cond=cross_attn_cond,
+        in_concat_cond=in_concat_cond,
     )
     pipeline = pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
@@ -255,21 +265,17 @@ def main() -> None:
 
         with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
             # Encode the clip into JEPA features
-            encoder_hidden_states = encoder(clips)
-            encoder_hidden_states = F.layer_norm(
-                encoder_hidden_states, (encoder_hidden_states.size(-1),)
-            )
+            jepa_features = encoder(clips)
+            jepa_features = F.layer_norm(jepa_features, (jepa_features.size(-1),))
 
             # (B, L, D) -> (B * num_frames, L, D), L is the number of patches, D is the embedding dimension
-            encoder_hidden_states = encoder_hidden_states.repeat_interleave(
-                num_frames, dim=0
-            )
+            jepa_features = jepa_features.repeat_interleave(num_frames, dim=0)
 
             # Create class labels indicating which frame we are reconstructing
             class_labels = torch.arange(num_frames, device=device)
 
             reconstructed_images = pipeline(
-                encoder_hidden_states=encoder_hidden_states,
+                jepa_features=jepa_features,
                 class_labels=class_labels,
                 num_inference_steps=num_inference_steps,
                 generator=torch.Generator(device=device).manual_seed(seed),

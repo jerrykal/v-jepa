@@ -97,6 +97,8 @@ def main(args, resume_preempt=False):
     out_channels = cfgs_diffusion.get("out_channels", 4)
     sample_size = cfgs_diffusion.get("sample_size", 64)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
+    attention_head_dim = cfgs_diffusion.get("attention_head_dim", 8)
+    dropout = cfgs_diffusion.get("dropout", 0.0)
     block_out_channels = cfgs_diffusion.get(
         "block_out_channels", (320, 640, 1280, 1280)
     )
@@ -133,6 +135,7 @@ def main(args, resume_preempt=False):
     )
     cross_attn_cond = cfgs_diffusion.get("cross_attn_cond", True)
     in_concat_cond = cfgs_diffusion.get("in_concat_cond", False)
+    do_edm_style_training = cfgs_diffusion.get("do_edm_style_training", False)
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -240,6 +243,8 @@ def main(args, resume_preempt=False):
         out_channels=out_channels,
         sample_size=sample_size,
         layers_per_block=layers_per_block,
+        attention_head_dim=attention_head_dim,
+        dropout=dropout,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
@@ -249,6 +254,7 @@ def main(args, resume_preempt=False):
         scheduler_prediction_type=scheduler_prediction_type,
         cross_attn_cond=cross_attn_cond,
         in_concat_cond=in_concat_cond,
+        do_edm_style_training=do_edm_style_training,
     )
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -323,7 +329,7 @@ def main(args, resume_preempt=False):
         vae.requires_grad_(False)
 
         # The factor by which the image size is downsampled by the VAE
-        vae_downsample_factor = vae.config.sample_size // unet.config.sample_size
+        vae_downsample_factor = 2 ** (len(vae.config.block_out_channels) - 1)
 
     # -- load training checkpoint
     if load_model:
@@ -375,6 +381,18 @@ def main(args, resume_preempt=False):
                 loader = iter(unsupervised_loader)
                 udata = next(loader)
 
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
+        schedule_timesteps = noise_scheduler.timesteps.to(device)
+        timesteps = timesteps.to(device)
+
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
@@ -420,7 +438,7 @@ def main(args, resume_preempt=False):
                     jepa_features = jepa_features.repeat_interleave(num_frames, dim=0)
 
                     # Denormalize clips to range [0, 1] & reshape to a larger batch of images
-                    images = denormalize_clips(clips.clone())
+                    images = denormalize_clips(clips)
                     images = rearrange(images, "b c f h w -> (b f) c h w")
 
                     # Normalize clips to range (-1, 1)
@@ -446,13 +464,24 @@ def main(args, resume_preempt=False):
                     # Sample noise that we'll add to the latents
                     noise = torch.randn_like(latents, device=device)
 
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(
-                        0,
-                        noise_scheduler.config.num_train_timesteps,
-                        (latents.shape[0],),
-                        device=device,
-                    ).long()
+                    if not do_edm_style_training:
+                        # Sample a random timestep for each image
+                        timesteps = torch.randint(
+                            0,
+                            noise_scheduler.config.num_train_timesteps,
+                            (latents.shape[0],),
+                            device=device,
+                        ).long()
+                    else:
+                        # in EDM formulation, the model is conditioned on the pre-conditioned noise levels
+                        # instead of discrete timesteps, so here we sample indices to get the noise levels
+                        # from `scheduler.timesteps`
+                        indices = torch.randint(
+                            0,
+                            noise_scheduler.config.num_train_timesteps,
+                            (latents.shape[0],),
+                        )
+                        timesteps = noise_scheduler.timesteps[indices].to(device=device)
 
                     # Create class labels indicating which frame we are reconstructing
                     class_labels = torch.arange(num_frames, device=device)
@@ -460,6 +489,19 @@ def main(args, resume_preempt=False):
 
                     # Add noise to the clean latents
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                    # For EDM-style training, we first obtain the sigmas based on the continuous timesteps.
+                    # We then precondition the final model inputs based on these sigmas instead of the timesteps.
+                    # Follow: Section 5 of https://huggingface.co/papers/2206.00364.
+                    if do_edm_style_training:
+                        sigmas = get_sigmas(
+                            timesteps,
+                            len(noisy_latents.shape),
+                            noisy_latents.dtype,
+                        )
+                        inp_noisy_latents = noise_scheduler.precondition_inputs(
+                            noisy_latents, sigmas
+                        )
 
                     # Concatenate JEPA features with diffusion latent
                     if in_concat_cond:
@@ -475,26 +517,55 @@ def main(args, resume_preempt=False):
                             size=(noisy_latents.shape[2], noisy_latents.shape[3]),
                             mode="bilinear",
                         )
-                        noisy_latents = torch.cat([jepa_cond, noisy_latents], dim=1)
+                        latent_model_input = torch.cat(
+                            [
+                                jepa_cond,
+                                inp_noisy_latents
+                                if do_edm_style_training
+                                else noisy_latents,
+                            ],
+                            dim=1,
+                        )
+                    else:
+                        latent_model_input = (
+                            inp_noisy_latents
+                            if do_edm_style_training
+                            else noisy_latents
+                        )
 
                     # Get the model prediction
                     if cross_attn_cond:
-                        noise_pred = unet(
-                            noisy_latents,
-                            timesteps,
-                            jepa_features,
-                            class_labels,
+                        model_pred = unet(
+                            sample=latent_model_input,
+                            timestep=timesteps,
+                            encoder_hidden_states=jepa_features,
+                            class_labels=class_labels,
                             return_dict=False,
                         )[0]
                     else:
-                        noise_pred = unet(
-                            noisy_latents, timesteps, class_labels, return_dict=False
+                        model_pred = unet(
+                            sample=latent_model_input,
+                            timestep=timesteps,
+                            class_labels=class_labels,
+                            return_dict=False,
                         )[0]
 
+                    if do_edm_style_training:
+                        # Similar to the input preconditioning, the model predictions are also preconditioned
+                        # on noised model inputs (before preconditioning) and the sigmas.
+                        # Follow: Section 5 of https://huggingface.co/papers/2206.00364.
+                        model_pred = noise_scheduler.precondition_outputs(
+                            noisy_latents, model_pred, sigmas
+                        )
+
                     if noise_scheduler.config.prediction_type == "epsilon":
-                        target = noise
+                        target = latents if do_edm_style_training else noise
                     elif noise_scheduler.config.prediction_type == "v_prediction":
-                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                        target = (
+                            latents
+                            if do_edm_style_training
+                            else noise_scheduler.get_velocity(latents, noise, timesteps)
+                        )
                     else:
                         raise ValueError(
                             f"Unsupported prediction type: {noise_scheduler.config.prediction_type}"
@@ -502,7 +573,7 @@ def main(args, resume_preempt=False):
 
                     # Compute the loss
                     loss = F.mse_loss(
-                        noise_pred.float(), target.float(), reduction="mean"
+                        model_pred.float(), target.float(), reduction="mean"
                     )
 
                 # Step 2. Backward & step
