@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from gym import spaces
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -99,8 +100,13 @@ class JEPAExtractor(BaseFeaturesExtractor):
 
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        B, FC, H, W = observations.shape 
-        observations = observations.view(B, 3, 4, H, W)
-        x = normalize_tensor(observations)
-        x = self._pooler(self._encoder(x)).squeeze(1)
-        return self._out_linear(x)
+        B, CT, H, W = observations.shape 
+        with torch.amp.autocast(device_type=observations.device.type, dtype=torch.bfloat16, enabled=True):
+            observations = observations.view(B, 3, 4, H, W)
+            observations = observations.repeat_interleave(4, dim=2)
+            x = normalize_tensor(observations)
+            x = self._encoder(x)
+            x = F.layer_norm(x, (x.size(-1),))
+            x = self._pooler(x).squeeze(1)
+            x = self._out_linear(x)
+        return x

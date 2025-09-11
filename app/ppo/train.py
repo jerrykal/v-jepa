@@ -10,7 +10,7 @@ import yaml
 from stable_baselines3.common.vec_env import VecFrameStack
 from stable_baselines3.common.env_util import make_vec_env
 
-from libs.mine_env.utils.actor_critic import ActorCriticPolicy
+from libs.mine_env.utils.actor_critic import DreamerActorCritic
 from libs.mine_env.utils.ppo_model import build_ppo 
 from libs.mine_env.src.env_factory import build_env
 from src.utils.logging import get_logger
@@ -101,7 +101,7 @@ def main(args: Dict[str, Any], resume_preempt: bool = False):
     model, episode_logger_callback = build_ppo(
         vec_env=vec_env,
         num_envs=num_envs,
-        policy=ActorCriticPolicy,
+        policy=DreamerActorCritic,
         policy_kwargs=policy_kwargs,
         log_dir=log_dir,
         gamma=algo_gamma,
