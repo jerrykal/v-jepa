@@ -76,7 +76,7 @@ def main(args: Dict[str, Any], resume_preempt: bool = False):
     task = env_cfg["task"]
     num_envs = int(env_cfg["num_envs"])
     seed = int(env_cfg["seed"])
-    frame_stack = int(env_cfg.get("frame_stack", 4)) 
+    frame_stack = args["ppo_training"]["policy"]["features_extractor"]["kwargs"]["num_frames"]
 
     # ----- VecEnv & FrameStack -----
     vec_env = make_vec_env(lambda: build_env(args, seed), n_envs=num_envs)

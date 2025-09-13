@@ -71,6 +71,7 @@ class JEPAExtractor(BaseFeaturesExtractor):
         use_sdpa: bool = True,
         pooler_params: dict = {}
     ):
+        self._num_frames = num_frames
         super().__init__(observation_space, features_dim)
         encoder =  video_vit.__dict__[model_name](
             img_size=crop_size,
@@ -102,8 +103,8 @@ class JEPAExtractor(BaseFeaturesExtractor):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         B, CT, H, W = observations.shape 
         with torch.amp.autocast(device_type=observations.device.type, dtype=torch.bfloat16, enabled=True):
-            observations = observations.view(B, 3, 4, H, W)
-            observations = observations.repeat_interleave(4, dim=2)
+            observations = observations.view(B, 3, self._num_frames, H, W)
+            # observations = observations.repeat_interleave(4, dim=2)
             x = normalize_tensor(observations)
             x = self._encoder(x)
             x = F.layer_norm(x, (x.size(-1),))

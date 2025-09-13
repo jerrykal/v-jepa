@@ -15,7 +15,6 @@ Environment:
   seed: 123
   action_space: ReducedActionSpace
   observation: ImageObservation
-  frame_stack: 4
 
 ppo_training:
   save_name: "1M_JEPA_CombatSpider"
