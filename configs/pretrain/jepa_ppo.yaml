@@ -18,7 +18,7 @@ Environment:
   frame_stack: 4
 
 ppo_training:
-  save_name: "1M_JEPA_HarvestWool"
+  save_name: "1M_JEPA_CombatSpider"
   training_step: 1000000
   eval_episode: 10
 
@@ -57,4 +57,4 @@ ppo_training:
 
 logging:
   folder: "logs/ppo/test"               # Folder for logs
-  write_tag: "wm"               # Logging tag
+  write_tag: "ppo"               # Logging tag
