@@ -71,6 +71,7 @@ class JEPAExtractor(BaseFeaturesExtractor):
         use_sdpa: bool = True,
         pooler_params: dict = {}
     ):
+        self._num_patchs = (crop_size//patch_size) ** 2
         self._num_frames = num_frames
         super().__init__(observation_space, features_dim)
         encoder =  video_vit.__dict__[model_name](
@@ -106,7 +107,7 @@ class JEPAExtractor(BaseFeaturesExtractor):
             observations = observations.view(B, 3, self._num_frames, H, W)
             # observations = observations.repeat_interleave(4, dim=2)
             x = normalize_tensor(observations)
-            x = self._encoder(x)
+            x = self._encoder(x)[:, -self._num_patchs:]
             x = F.layer_norm(x, (x.size(-1),))
             x = self._pooler(x).squeeze(1)
             x = self._out_linear(x)
