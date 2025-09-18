@@ -99,6 +99,7 @@ def main(args, resume_preempt=False):
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
     attention_head_dim = cfgs_diffusion.get("attention_head_dim", 8)
     dropout = cfgs_diffusion.get("dropout", 0.0)
+    cross_attention_dim = cfgs_diffusion.get("cross_attention_dim", None)
     block_out_channels = cfgs_diffusion.get(
         "block_out_channels", (320, 640, 1280, 1280)
     )
@@ -253,6 +254,7 @@ def main(args, resume_preempt=False):
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
         cross_attn_cond=cross_attn_cond,
+        cross_attention_dim=cross_attention_dim,
         in_concat_cond=in_concat_cond,
         do_edm_style_training=do_edm_style_training,
     )
@@ -333,7 +335,7 @@ def main(args, resume_preempt=False):
 
     # -- load training checkpoint
     if load_model:
-        epoch = load_checkpoint(
+        start_epoch = load_checkpoint(
             r_path=load_path,
             unet=unet,
             noise_scheduler=noise_scheduler,

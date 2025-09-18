@@ -93,6 +93,8 @@ def main() -> None:
     out_channels = cfgs_diffusion.get("out_channels", 4)
     sample_size = cfgs_diffusion.get("sample_size", 64)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
+    attention_head_dim = cfgs_diffusion.get("attention_head_dim", 8)
+    dropout = cfgs_diffusion.get("dropout", 0.0)
     block_out_channels = cfgs_diffusion.get(
         "block_out_channels", (320, 640, 1280, 1280)
     )
@@ -129,6 +131,7 @@ def main() -> None:
     )
     cross_attn_cond = cfgs_diffusion.get("cross_attn_cond", True)
     in_concat_cond = cfgs_diffusion.get("in_concat_cond", False)
+    do_edm_style_training = cfgs_diffusion.get("do_edm_style_training", False)
 
     # -- DATA
     cfgs_data = configs.get("data")
@@ -198,7 +201,7 @@ def main() -> None:
     )
     logger.info("Initialized data-loaders/samplers")
 
-    # Init models
+    # -- init model
     encoder, unet, noise_scheduler = init_models(
         device=device,
         uniform_power=uniform_power,
@@ -212,6 +215,8 @@ def main() -> None:
         out_channels=out_channels,
         sample_size=sample_size,
         layers_per_block=layers_per_block,
+        attention_head_dim=attention_head_dim,
+        dropout=dropout,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
@@ -221,6 +226,7 @@ def main() -> None:
         scheduler_prediction_type=scheduler_prediction_type,
         cross_attn_cond=cross_attn_cond,
         in_concat_cond=in_concat_cond,
+        do_edm_style_training=do_edm_style_training,
     )
     logger.info("Initialized models")
 
@@ -232,6 +238,8 @@ def main() -> None:
         vae = get_pretrained_vae(vae_model_id, device)
         vae.eval()
         logger.info("Loaded VAE")
+
+        vae_downsample_factor = 2 ** (len(vae.config.block_out_channels) - 1)
 
     # Load denoising UNet weight
     if r_file is not None:
@@ -283,6 +291,20 @@ def main() -> None:
 
         clips = denormalize_clips(clips)
         clips = rearrange(clips, "b c f h w -> (b f) c h w")
+
+        if do_latent_diffusion:
+            clips = clips * 2.0 - 1.0
+            clips = F.interpolate(
+                clips,
+                size=(
+                    sample_size * vae_downsample_factor,
+                    sample_size * vae_downsample_factor,
+                ),
+                mode="bilinear",
+            )
+            clips = vae.decode(vae.encode(clips).latent_dist.sample()).sample
+
+            clips = (clips * 0.5 + 0.5).clamp(0, 1)
 
         # Rearrange both clips and reconstructed images to be (C, F, H, W)
         clips = clips.permute(1, 0, 2, 3)

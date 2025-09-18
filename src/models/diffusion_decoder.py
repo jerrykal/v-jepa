@@ -131,6 +131,7 @@ def get_unet_and_scheduler(
     down_block_types: tuple[str, ...],
     up_block_types: tuple[str, ...],
     num_class_embeds: int,
+    encoder_hid_dim: int,
     cross_attention_dim: int | None = None,
     scheduler_beta_start: float = 0.00085,
     scheduler_beta_end: float = 0.012,
@@ -149,6 +150,7 @@ def get_unet_and_scheduler(
             block_out_channels=block_out_channels,
             down_block_types=down_block_types,
             up_block_types=up_block_types,
+            encoder_hid_dim=encoder_hid_dim,
             cross_attention_dim=cross_attention_dim,
             num_class_embeds=num_class_embeds,
         )
