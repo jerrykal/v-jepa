@@ -42,9 +42,9 @@ def load_pretrained_model(
         return encoder
 
     try:
-        module = _load_component(checkpoint, 'target_encoder', encoder, use_ddp)
+        encoder = _load_component(checkpoint, 'target_encoder', encoder, use_ddp)
         if not gradient:
-            for param in module.parameters():
+            for param in encoder.parameters():
                 param.requires_grad_(False)
 
     except Exception as e:
@@ -74,6 +74,7 @@ class JEPAExtractor(BaseFeaturesExtractor):
         self._num_patchs = (crop_size//patch_size) ** 2
         self._num_output_feat = (num_frames // tubelet_size)//2
         self._num_frames = num_frames
+        self._num_queries = 1
         super().__init__(observation_space, features_dim)
         encoder =  video_vit.__dict__[model_name](
             img_size=crop_size,
@@ -84,10 +85,13 @@ class JEPAExtractor(BaseFeaturesExtractor):
             use_sdpa=use_sdpa, # not using
         )
         encoder = MultiMaskWrapper(encoder)
-        self._encoder = load_pretrained_model(pretrain_path, encoder, False)
+        self._encoder = load_pretrained_model(
+             model_path=pretrain_path, 
+             encoder=encoder, 
+             gradient=False, use_ddp=False)
         
         self._pooler = AttentivePooler(
-            num_queries=1,
+            num_queries=self._num_queries,
             embed_dim=encoder.backbone.embed_dim,
             num_heads=pooler_params["num_heads"],
             mlp_ratio=pooler_params["mlp_ratio"],
@@ -98,18 +102,19 @@ class JEPAExtractor(BaseFeaturesExtractor):
             complete_block=pooler_params["complete_block"],
         )
 
-        self._out_linear = nn.Linear(encoder.backbone.embed_dim, features_dim, bias=True)
-
-
+        self._out_linear = nn.Linear(self._num_queries * encoder.backbone.embed_dim, features_dim, bias=True)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         B, CT, H, W = observations.shape 
+        self._encoder.eval()
         with torch.amp.autocast(device_type=observations.device.type, dtype=torch.bfloat16, enabled=True):
             observations = observations.view(B, 3, self._num_frames, H, W)
             # observations = observations.repeat_interleave(4, dim=2)
-            x = normalize_tensor(observations)
-            x = self._encoder(x)[:, -self._num_output_feat * self._num_patchs:]
+            with torch.no_grad():
+                x = normalize_tensor(observations)
+                x = self._encoder(x)[:, -self._num_output_feat * self._num_patchs:]
             x = F.layer_norm(x, (x.size(-1),))
-            x = self._pooler(x).squeeze(1)
+            x = self._pooler(x)
+            x = x.view(B,self._num_queries * self._encoder.backbone.embed_dim)
             x = self._out_linear(x)
         return x

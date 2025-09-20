@@ -115,6 +115,7 @@ def main(args: Dict[str, Any], resume_preempt: bool = False):
     print("MLP extractor:", getattr(model.policy, "mlp_extractor", None))
 
     # ----- Train -----
+    model.batch_size
     model.learn(total_timesteps=total_timesteps, callback=episode_logger_callback)
 
     # ----- Save -----

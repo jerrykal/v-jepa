@@ -11,7 +11,7 @@ Environment:
     step_penalty: 0
     attack_reward: 1
     success_reward: 10
-  num_envs: 1
+  num_envs: 2
   seed: 123
   action_space: ReducedActionSpace
   observation: ImageObservation
