@@ -37,6 +37,7 @@ class JEPADecoderPipeline(DiffusionPipeline):
         class_labels: torch.Tensor | None = None,
         num_inference_steps: int = 50,
         generator: torch.Generator | None = None,
+        output_type: str = "image",
     ):
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=self._execution_device)
@@ -111,10 +112,14 @@ class JEPADecoderPipeline(DiffusionPipeline):
             latents = latents[:, -self.unet.config.out_channels :]
 
         if self.vae is not None:
-            generated_images = self.vae.decode(
-                latents / self.vae.config.scaling_factor, return_dict=True
-            )[0]
+            latents = latents / self.vae.config.scaling_factor
+            if output_type == "image":
+                generated_images = self.vae.decode(latents, return_dict=True)[0]
+            else:
+                generated_images = latents
         else:
+            if output_type == "latent":
+                raise ValueError("Output type is latent, but no VAE is provided")
             generated_images = latents
 
         return generated_images
