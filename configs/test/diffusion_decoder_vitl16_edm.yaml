@@ -16,10 +16,10 @@ data:
   clip_duration: null
 
 logging:
-  folder: logs/test/diffusion_decoder_vitl16_edm_e300
+  folder: logs/test/diffusion_decoder_vitl16_edm
 
 meta:
-  read_checkpoint: logs/train/diffusion_decoder_vitl16_edm/diffusion_decoder-e300.pth.tar
+  read_checkpoint: logs/train/diffusion_decoder_vitl16_edm/diffusion_decoder.pth.tar
   seed: 234
   use_sdpa: true
   dtype: bfloat16
