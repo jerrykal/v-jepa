@@ -1,0 +1,61 @@
+data:
+  dataset_type: VideoDataset
+  datasets:
+    - data/CLIP4MC_Dataset/eval.csv
+  decode_one_clip: true #not using
+  batch_size: 1
+  num_clips: 1
+  num_frames: 16
+  tubelet_size: 2
+  sampling_rate: 4
+  crop_size: 224
+  patch_size: 16
+  pin_mem: true
+  num_workers: 4
+  filter_short_videos: false
+  clip_duration: null
+
+logging:
+  folder: logs/test/diffusion_decoder_vitl16_edm_e300
+
+meta:
+  read_checkpoint: logs/train/diffusion_decoder_vitl16_edm/diffusion_decoder-e300.pth.tar
+  seed: 234
+  use_sdpa: true
+  dtype: bfloat16
+  pre_train_model: weights/vitl16.pth.tar
+
+model:
+  model_name: vit_large
+  uniform_power: true
+
+diffusion:
+  in_channels: 4
+  out_channels: 4
+  sample_size: 32
+  layers_per_block: 2
+  block_out_channels:
+    - 320
+    - 640
+    - 1280
+    - 1280
+  down_block_types:
+    - "CrossAttnDownBlock2D"
+    - "CrossAttnDownBlock2D"
+    - "CrossAttnDownBlock2D"
+    - "DownBlock2D"
+  up_block_types:
+    - "UpBlock2D"
+    - "CrossAttnUpBlock2D"
+    - "CrossAttnUpBlock2D"
+    - "CrossAttnUpBlock2D"
+  scheduler_prediction_type: "epsilon"
+  do_latent_diffusion: true
+  do_edm_style_training: true
+  vae_model_id: stabilityai/stable-diffusion-xl-base-1.0
+  cross_attn_cond: true
+  in_concat_cond: false
+
+inference:
+  num_inference_steps: 25
+  num_samples_to_generate: 50
