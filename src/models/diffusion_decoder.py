@@ -8,6 +8,7 @@ from diffusers import (
     UNet2DModel,
 )
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 
 
@@ -50,12 +51,13 @@ class JEPADecoderPipeline(DiffusionPipeline):
             self.unet.config.sample_size,
             self.unet.config.sample_size,
         )
-        latents = torch.randn(
+        latents = randn_tensor(
             latents_shape,
             generator=generator,
             device=self._execution_device,
             dtype=jepa_features.dtype,
         )
+        latents = latents * self.scheduler.init_noise_sigma
 
         # Repeat the noise so that each image in the clip is denoised from the same noise
         latents = latents.repeat(jepa_features.shape[0], 1, 1, 1)
