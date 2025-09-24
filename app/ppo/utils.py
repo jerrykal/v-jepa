@@ -107,14 +107,13 @@ class JEPAExtractor(BaseFeaturesExtractor):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         B, CT, H, W = observations.shape 
         self._encoder.eval()
+        observations = observations.reshape(B, 3, self._num_frames, H, W)
+        x = normalize_tensor(observations)
         with torch.amp.autocast(device_type=observations.device.type, dtype=torch.bfloat16, enabled=True):
-            observations = observations.view(B, 3, self._num_frames, H, W)
-            # observations = observations.repeat_interleave(4, dim=2)
             with torch.no_grad():
-                x = normalize_tensor(observations)
-                x = self._encoder(x)[:, -self._num_output_feat * self._num_patchs:]
-            x = F.layer_norm(x, (x.size(-1),))
-            x = self._pooler(x)
-            x = x.view(B,self._num_queries * self._encoder.backbone.embed_dim)
-            x = self._out_linear(x)
-        return x
+                toks = self._encoder(x)[:, -self._num_output_feat * self._num_patchs:]
+            pooled = self._pooler(toks).reshape(B, -1) 
+            feat = F.layer_norm(pooled.float(), (pooled.size(-1),)).to(x.dtype)
+            feat = F.gelu(feat)
+            out = self._out_linear(feat)
+        return out
