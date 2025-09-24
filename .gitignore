@@ -10,4 +10,5 @@ experiments/*
 *.pkl
 *.npz
 .vscode/*
-train.sh
+trian.sh
+run.sh

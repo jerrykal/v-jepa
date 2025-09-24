@@ -1,0 +1,41 @@
+nodes: 8
+tasks_per_node: 8
+tag: visualization
+eval_name: ac_visualization_frozen
+
+meta:
+  ac_jepa_path: /path/to/logs/ac_wm/pretrain_vit16l_ac
+  decoder_path: /path/to/logs/train/vit_decoder_vitl16
+
+  enable_autoregressive: false
+  dtype: bfloat16        # bfloat16 / float16 / float32
+  use_sdpa: true
+  seed: 234
+
+data:
+  eval_datasets:
+    - data/CLIP4MC_Dataset/eval.csv
+
+
+  dataset_type: VideoDataset
+  batch_size: 1           
+  num_workers: 2
+  decode_one_clip: true  
+  pin_mem: true
+  filter_short_videos: false
+
+  # num_frames: 16
+  # tubelet_size: 2
+  # patch_size: 16
+  # crop_size: 224
+  # sampling_rate: 4
+
+
+model:
+  # decoder_depth: 8
+  # decoder_num_heads: 16
+  # decoder_mlp_ratio: 4.0
+
+logging:
+  folder: logs/eval/vit_decoder_vis
+  write_tag: eval_run

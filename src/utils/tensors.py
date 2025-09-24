@@ -9,17 +9,44 @@ import math
 
 import torch
 from torchvision import transforms
-
+from functools import lru_cache
 from logging import getLogger
 
 logger = getLogger()
 
-_normalize = transforms.Normalize(
-    mean=(0.485, 0.456, 0.406),
-    std=(0.229, 0.224, 0.225)
-)
+def unnormalize_tensor(
+        x: torch.Tensor,
+        normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    )-> torch.Tensor:
+    """
+    Args:
+        tensor: torch.Tensor, shape [B, C, F, H, W]
+        mean: torch.Tensor, shape [C], mean values
+        std: torch.Tensor, shape [C], std values
 
-def normalize_tensor(x: torch.Tensor) -> torch.Tensor:
+    Returns:
+        torch.Tensor, shape [B, C, F, H, W], values in [0, 1]
+    """
+    tensor = x.clone().contiguous()
+    mean = (
+        torch.tensor(normalize[0], dtype=torch.float32).to(tensor.device).unsqueeze(0)
+    )
+    std = torch.tensor(normalize[1], dtype=torch.float32).to(tensor.device).unsqueeze(0)
+
+    B, C, F, H, W = tensor.shape
+    tensor = tensor.view(B, C, -1).permute(0, 2, 1)
+    tensor.mul_(std).add_(mean)
+    tensor = tensor.permute(0, 2, 1).view(B, C, F, H, W)
+    return tensor
+
+@lru_cache(maxsize=None)
+def get_normalize(normalize):
+    return transforms.Normalize(mean=normalize[0], std=normalize[1])
+
+def normalize_tensor(
+        x: torch.Tensor,
+        normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ) -> torch.Tensor:
     """
     Normalize a batch of video tensors to match ImageNet convention.
 
@@ -29,6 +56,7 @@ def normalize_tensor(x: torch.Tensor) -> torch.Tensor:
     Returns:
         Normalized tensor with same shape [B, C, T, H, W].
     """
+    _normalize = get_normalize(normalize)
     if not torch.is_floating_point(x):
         x = x.float()
 

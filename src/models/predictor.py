@@ -61,13 +61,16 @@ class VisionTransformerPredictor(nn.Module):
         **kwargs
     ):
         super().__init__()
-        # Map input to predictor dimension
-        self.predictor_context_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
-        self.predictor_action_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+        self.action_adapter_type = kwargs.get("adapter_type", "None")
 
+        # Map input to predictor dimension
+        if self.action_adapter_type != "None":
+            self.predictor_context_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+            self.predictor_action_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+        else:
+            self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
         # Action input adapter
-        self.action_adapter_type = kwargs.get("adapter_type", "None")
         if self.action_adapter_type != "None":
             self.action_dim = kwargs.get("action_dim")
             self.action_adapter = ConcatAdapter()
@@ -216,16 +219,22 @@ class VisionTransformerPredictor(nn.Module):
         B = len(ctxt) // len(masks_ctxt)
 
         # Map context tokens to pedictor dimensions
-        x = self.predictor_context_embed(ctxt)
-        act = self.predictor_action_embed(act)
-        
+        if self.action_adapter_type != "None":
+            x = self.predictor_context_embed(ctxt)
+            if act is not None:
+                act = self.predictor_action_embed(act)
+        else:
+            x = self.predictor_embed(ctxt)
+
         _, N_ctxt, D = x.shape
         # Add positional embedding to ctxt tokens
         if self.predictor_pos_embed is not None:
             ctxt_pos_embed = self.predictor_pos_embed.repeat(B, 1, 1)
             x += apply_masks(ctxt_pos_embed, masks_ctxt)
 
-        x = self.action_adapter(x, act)
+        if act is not None:
+            x = self.action_adapter(x, act)
+            
         # Map target tokens to predictor dimensions & add noise (fwd diffusion)
         if self.mask_tokens is None:
             pred_tokens = self.predictor_embed(tgt)
