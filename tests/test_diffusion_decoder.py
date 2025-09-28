@@ -15,24 +15,18 @@ from tqdm import tqdm
 
 import src.datasets.utils.video.transforms as video_transforms
 import src.datasets.utils.video.volume_transforms as volume_transforms
-from app.diffusion_decoder.utils import init_models, load_checkpoint, load_jepa_encoder
+from app.diffusion_decoder.transforms import denormalize_clips
+from app.diffusion_decoder.utils import (
+    get_pretrained_vae,
+    init_models,
+    load_checkpoint,
+    load_jepa_encoder,
+)
 from src.datasets.data_manager import init_data
 from src.models.diffusion_decoder import JEPADecoderPipeline
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def unnormalize_tensor(tensor, mean, std):
-    tensor = tensor.clone().contiguous()
-    mean = mean.to(tensor.device)
-    std = std.to(tensor.device)
-
-    C, T, H, W = tensor.shape
-    tensor = tensor.view(C, -1).permute(1, 0)
-    tensor.mul_(std).add_(mean)
-    tensor = tensor.permute(1, 0).view(C, T, H, W)
-    return tensor
 
 
 def save_tensor_as_gif(tensor, output_path, duration=100):
@@ -95,16 +89,20 @@ def main() -> None:
 
     # -- DIFFUSION
     cfgs_diffusion = configs.get("diffusion")
-    sample_size = cfgs_diffusion.get("sample_size", 224)
-    in_channels = cfgs_diffusion.get("in_channels", 3)
-    out_channels = cfgs_diffusion.get("out_channels", 3)
+    in_channels = cfgs_diffusion.get("in_channels", 4)
+    out_channels = cfgs_diffusion.get("out_channels", 4)
+    sample_size = cfgs_diffusion.get("sample_size", 64)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
-    block_out_channels = cfgs_diffusion.get("block_out_channels", (64, 128, 256, 256))
+    attention_head_dim = cfgs_diffusion.get("attention_head_dim", 8)
+    dropout = cfgs_diffusion.get("dropout", 0.0)
+    block_out_channels = cfgs_diffusion.get(
+        "block_out_channels", (320, 640, 1280, 1280)
+    )
     down_block_types = cfgs_diffusion.get(
         "down_block_types",
         (
-            "DownBlock2D",
-            "DownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
             "CrossAttnDownBlock2D",
             "DownBlock2D",
         ),
@@ -114,8 +112,8 @@ def main() -> None:
         (
             "UpBlock2D",
             "CrossAttnUpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D",
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
         ),
     )
     scheduler_beta_start = cfgs_diffusion.get("scheduler_beta_start", 0.00085)
@@ -126,6 +124,14 @@ def main() -> None:
     scheduler_prediction_type = cfgs_diffusion.get(
         "scheduler_prediction_type", "epsilon"
     )
+    do_latent_diffusion = cfgs_diffusion.get("do_latent_diffusion", True)
+    vae_model_id = cfgs_diffusion.get("vae_model_id", None)
+    assert not do_latent_diffusion or vae_model_id is not None, (
+        "VAE model must be provided if latent diffusion is enabled"
+    )
+    cross_attn_cond = cfgs_diffusion.get("cross_attn_cond", True)
+    in_concat_cond = cfgs_diffusion.get("in_concat_cond", False)
+    do_edm_style_training = cfgs_diffusion.get("do_edm_style_training", False)
 
     # -- DATA
     cfgs_data = configs.get("data")
@@ -195,7 +201,7 @@ def main() -> None:
     )
     logger.info("Initialized data-loaders/samplers")
 
-    # Init models
+    # -- init model
     encoder, unet, noise_scheduler = init_models(
         device=device,
         uniform_power=uniform_power,
@@ -204,11 +210,13 @@ def main() -> None:
         tubelet_size=tubelet_size,
         model_name=model_name,
         crop_size=crop_size,
-        sample_size=sample_size,
         use_sdpa=use_sdpa,
         in_channels=in_channels,
         out_channels=out_channels,
+        sample_size=sample_size,
         layers_per_block=layers_per_block,
+        attention_head_dim=attention_head_dim,
+        dropout=dropout,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
@@ -216,22 +224,41 @@ def main() -> None:
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
+        cross_attn_cond=cross_attn_cond,
+        in_concat_cond=in_concat_cond,
+        do_edm_style_training=do_edm_style_training,
     )
     logger.info("Initialized models")
 
     # Load encoder weight
-    encoder = load_jepa_encoder(pre_train_model, encoder)
+    load_jepa_encoder(pre_train_model, encoder)
+
+    # Load VAE weight
+    if do_latent_diffusion:
+        vae = get_pretrained_vae(vae_model_id, device)
+        vae.eval()
+        logger.info("Loaded VAE")
+
+        vae_downsample_factor = 2 ** (len(vae.config.block_out_channels) - 1)
 
     # Load denoising UNet weight
     if r_file is not None:
-        unet, noise_scheduler, _, _, _ = load_checkpoint(
+        load_checkpoint(
             r_path=r_file,
             unet=unet,
             noise_scheduler=noise_scheduler,
         )
 
     # Create diffusion pipeline
-    pipeline = JEPADecoderPipeline(unet=unet, scheduler=noise_scheduler)
+    pipeline = JEPADecoderPipeline(
+        unet=unet,
+        scheduler=noise_scheduler,
+        vae=vae,
+        img_size=crop_size,
+        patch_size=patch_size,
+        cross_attn_cond=cross_attn_cond,
+        in_concat_cond=in_concat_cond,
+    )
     pipeline = pipeline.to(device)
     pipeline.set_progress_bar_config(disable=True)
     logger.info("Created diffusion pipeline")
@@ -246,44 +273,48 @@ def main() -> None:
 
         with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
             # Encode the clip into JEPA features
-            encoder_hidden_states = encoder(clips)
-            encoder_hidden_states = F.layer_norm(
-                encoder_hidden_states, (encoder_hidden_states.size(-1),)
-            )
+            jepa_features = encoder(clips)
+            jepa_features = F.layer_norm(jepa_features, (jepa_features.size(-1),))
 
             # (B, L, D) -> (B * num_frames, L, D), L is the number of patches, D is the embedding dimension
-            encoder_hidden_states = encoder_hidden_states.repeat_interleave(
-                num_frames, dim=0
-            )
+            jepa_features = jepa_features.repeat_interleave(num_frames, dim=0)
 
             # Create class labels indicating which frame we are reconstructing
             class_labels = torch.arange(num_frames, device=device)
 
             reconstructed_images = pipeline(
-                encoder_hidden_states=encoder_hidden_states,
+                jepa_features=jepa_features,
                 class_labels=class_labels,
                 num_inference_steps=num_inference_steps,
                 generator=torch.Generator(device=device).manual_seed(seed),
             )
 
+        clips = denormalize_clips(clips)
         clips = rearrange(clips, "b c f h w -> (b f) c h w")
-        if crop_size != sample_size:
-            clips = F.interpolate(clips, size=sample_size, mode="bilinear")
+
+        if do_latent_diffusion:
+            clips = clips * 2.0 - 1.0
+            clips = F.interpolate(
+                clips,
+                size=(
+                    sample_size * vae_downsample_factor,
+                    sample_size * vae_downsample_factor,
+                ),
+                mode="bilinear",
+            )
+            clips = vae.decode(vae.encode(clips).latent_dist.sample()).sample
+
+            clips = (clips * 0.5 + 0.5).clamp(0, 1)
 
         # Rearrange both clips and reconstructed images to be (C, F, H, W)
         clips = clips.permute(1, 0, 2, 3)
         reconstructed_images = reconstructed_images.permute(1, 0, 2, 3)
 
-        # Unnormalize the clips and reconstructed images for visualization
-        clips_unnormalized = unnormalize_tensor(clips, normalize_mean, normalize_std)
-        reconstructed_unnormalized = unnormalize_tensor(
-            reconstructed_images, normalize_mean, normalize_std
-        )
+        # Denormalize the reconstructed images for visualization
+        reconstructed = (reconstructed_images * 0.5 + 0.5).clamp(0, 1)
 
         # Save both original and reconstructed images side by side
-        combined_images = torch.cat(
-            [clips_unnormalized, reconstructed_unnormalized], dim=3
-        )
+        combined_images = torch.cat([clips, reconstructed], dim=3)
         save_tensor_as_gif(
             combined_images,
             os.path.join(folder, f"{i:02d}.gif"),

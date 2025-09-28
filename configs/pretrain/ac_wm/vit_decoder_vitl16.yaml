@@ -1,0 +1,68 @@
+app: vit_decoder
+nodes: 16
+tasks_per_node: 8
+
+data:
+  dataset_type: VideoDataset
+  train_datasets:
+    - data/CLIP4MC_Dataset/train.csv
+  eval_datasets:
+    - data/CLIP4MC_Dataset/eval.csv
+  decode_one_clip: true #not using
+  batch_size: 8
+  num_clips: 1
+  num_frames: 16
+  tubelet_size: 2
+  sampling_rate: 4
+  crop_size: 224
+  patch_size: 16
+  pin_mem: true
+  num_workers: 4
+  filter_short_videos: false
+  clip_duration: null
+
+data_aug:
+  auto_augment: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 0.3
+  - 1.0
+  reprob: 0.0
+
+logging:
+  folder: logs/train/vit_decoder_vitl16
+  write_tag: vit_decoder
+
+meta:
+  load_checkpoint: false
+  read_checkpoint: null
+  seed: 234
+  use_sdpa: true
+  dtype: bfloat16
+  pre_train_model: weights/vitl16.pth.tar
+  eval_freq: 1
+  save_every_freq: 200
+
+model:
+  model_name: vit_large
+  uniform_power: true
+  decoder_depth: 8
+  decoder_num_heads: 16
+  decoder_mlp_ratio: 4.0
+
+optimization:
+  ipe: null
+  lr_scheduler_type: cosine
+  lr: 1.5e-4
+  clip_grad: 1.0
+  epochs: 800
+  warmup: 40
+  betas:
+    - 0.9
+    - 0.95
+  weight_decay: 0.05
+  eps: 1.0e-8
+  perceptual_loss_weight: 0.01

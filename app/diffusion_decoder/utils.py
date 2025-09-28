@@ -9,7 +9,8 @@ import logging
 import sys
 
 import torch
-from diffusers import DDIMScheduler
+import torch.nn as nn
+from diffusers import AutoencoderKL, DDIMScheduler, EDMEulerScheduler
 from diffusers.optimization import get_scheduler
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
@@ -25,7 +26,7 @@ logger = logging.getLogger()
 
 def load_jepa_encoder(
     model_path: str,
-    encoder: torch.nn.Module,
+    encoder: nn.Module,
 ):
     try:
         checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
@@ -52,21 +53,25 @@ def load_jepa_encoder(
     except Exception as e:
         logger.info(f"Failed to load JEPA encoder: {e}")
 
-    return encoder
+
+def get_pretrained_vae(
+    model_id: str,
+    device: torch.device,
+):
+    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+    vae.to(device)
+    logger.info(f"Loaded VAE from {model_id}")
+
+    return vae
 
 
 def load_checkpoint(
     r_path: str,
-    unet: torch.nn.Module,
+    unet: nn.Module,
     noise_scheduler: DDIMScheduler,
     opt: torch.optim.Optimizer | None = None,
     scaler: torch.cuda.amp.GradScaler | None = None,
-) -> tuple[
-    torch.nn.Module,
-    torch.optim.Optimizer | None,
-    torch.cuda.amp.GradScaler | None,
-    int,
-]:
+) -> int:
     try:
         checkpoint = torch.load(
             r_path, map_location=torch.device("cpu"), weights_only=False
@@ -109,13 +114,7 @@ def load_checkpoint(
         logger.info(f"Encountered exception when loading checkpoint {e}")
         epoch = 0
 
-    return (
-        unet,
-        noise_scheduler,
-        opt,
-        scaler,
-        epoch,
-    )
+    return epoch
 
 
 def init_models(
@@ -131,6 +130,8 @@ def init_models(
     in_channels: int = 3,
     out_channels: int = 3,
     layers_per_block: int = 2,
+    attention_head_dim: int = 8,
+    dropout: float = 0.0,
     block_out_channels: tuple[int, ...] = (128, 256, 512, 512),
     down_block_types: tuple[str, ...] = (
         "CrossAttnDownBlock2D",
@@ -148,7 +149,11 @@ def init_models(
     scheduler_beta_end: float = 0.012,
     scheduler_beta_schedule: str = "scaled_linear",
     scheduler_prediction_type: str = "epsilon",
-) -> tuple[torch.nn.Module, torch.nn.Module, DDIMScheduler]:
+    cross_attn_cond: bool = True,
+    cross_attention_dim: int | None = None,
+    in_concat_cond: bool = False,
+    do_edm_style_training: bool = False,
+) -> tuple[nn.Module, nn.Module, DDIMScheduler | EDMEulerScheduler]:
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
@@ -159,31 +164,44 @@ def init_models(
     )
     encoder = MultiMaskWrapper(encoder)
 
+    if in_concat_cond:
+        # Modified the input channel to accommodate concatenated JEPA conditioning.
+        in_channels = (
+            in_channels + (num_frames // tubelet_size) * encoder.backbone.embed_dim
+        )
+
+    if cross_attention_dim is None:
+        cross_attention_dim = encoder.backbone.embed_dim
+
     # Diffusion decoder and noise scheduler
     unet, noise_scheduler = get_unet_and_scheduler(
         sample_size=sample_size,
         in_channels=in_channels,
         out_channels=out_channels,
         layers_per_block=layers_per_block,
+        attention_head_dim=attention_head_dim,
+        dropout=dropout,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
-        cross_attention_dim=encoder.backbone.embed_dim,
+        encoder_hid_dim=encoder.backbone.embed_dim,
+        cross_attention_dim=cross_attention_dim if cross_attn_cond else None,
         num_class_embeds=num_frames,
         scheduler_beta_start=scheduler_beta_start,
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
+        do_edm_style_training=do_edm_style_training,
     )
 
     def init_weights(m):
-        if isinstance(m, torch.nn.Linear):
+        if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
-                torch.nn.init.constant_(m.bias, 0)
-        elif isinstance(m, torch.nn.LayerNorm):
-            torch.nn.init.constant_(m.bias, 0)
-            torch.nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
 
     for m in encoder.modules():
         init_weights(m)
@@ -204,7 +222,7 @@ def init_models(
 
 
 def init_opt(
-    models: list[torch.nn.Module],
+    models: list[nn.Module],
     scheduler_type: str,
     iterations_per_epoch: int,
     lr: float,
