@@ -7,7 +7,7 @@ data:
   datasets:
     - data/CLIP4MC_Dataset/train.csv
   decode_one_clip: true #not using
-  batch_size: 1
+  batch_size: 2
   num_clips: 1
   num_frames: 16
   tubelet_size: 2
@@ -31,53 +31,56 @@ data_aug:
   reprob: 0.0
 
 logging:
-  folder: logs/train/diffusion_decoder_vith16
+  folder: logs/train/diffusion_decoder_vitl16_edm
   write_tag: diffusion_decoder
 
 meta:
-  load_checkpoint: false
+  load_checkpoint: true
   read_checkpoint: null
   seed: 234
   use_sdpa: true
   dtype: bfloat16
-  pre_train_model: weights/vith16.pth.tar
+  pre_train_model: weights/vitl16.pth.tar
   gradient_checkpointing: true
+  save_every_freq: 100
 
 model:
-  model_name: vit_huge
+  model_name: vit_large
   uniform_power: true
 
 diffusion:
-  in_channels: 3
-  out_channels: 3
+  in_channels: 4
+  out_channels: 4
+  sample_size: 32
   layers_per_block: 2
   block_out_channels:
-    - 64
-    - 128
-    - 256
-    - 512
+    - 320
+    - 640
+    - 1280
+    - 1280
   down_block_types:
-    - "DownBlock2D"
-    - "DownBlock2D"
+    - "CrossAttnDownBlock2D"
+    - "CrossAttnDownBlock2D"
     - "CrossAttnDownBlock2D"
     - "DownBlock2D"
   up_block_types:
     - "UpBlock2D"
     - "CrossAttnUpBlock2D"
-    - "UpBlock2D"
-    - "UpBlock2D"
-  scheduler_beta_start: 0.00085
-  scheduler_beta_end: 0.012
-  scheduler_beta_schedule: "scaled_linear"
+    - "CrossAttnUpBlock2D"
+    - "CrossAttnUpBlock2D"
   scheduler_prediction_type: "epsilon"
-
+  do_latent_diffusion: true
+  do_edm_style_training: true
+  vae_model_id: stabilityai/stable-diffusion-xl-base-1.0
+  cross_attn_cond: true
+  in_concat_cond: false
 
 optimization:
-  ipe: 300
+  ipe: null
   lr_scheduler_type: constant
   lr: 2.0e-5
   clip_grad: 1.0
-  epochs: 300
+  epochs: 600
   warmup: 10
   betas:
     - 0.9

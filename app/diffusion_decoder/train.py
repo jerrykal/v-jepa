@@ -15,13 +15,14 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch.nn.parallel import DistributedDataParallel
 
+from app.diffusion_decoder.transforms import denormalize_clips, make_transforms
 from app.diffusion_decoder.utils import (
+    get_pretrained_vae,
     init_models,
     init_opt,
     load_checkpoint,
     load_jepa_encoder,
 )
-from app.vjepa.transforms import make_transforms
 from src.datasets.data_manager import init_data
 from src.utils.distributed import AllReduce, init_distributed
 from src.utils.logging import (
@@ -92,16 +93,21 @@ def main(args, resume_preempt=False):
 
     # -- DIFFUSION
     cfgs_diffusion = args.get("diffusion")
-    sample_size = cfgs_diffusion.get("sample_size", 224)
-    in_channels = cfgs_diffusion.get("in_channels", 3)
-    out_channels = cfgs_diffusion.get("out_channels", 3)
+    in_channels = cfgs_diffusion.get("in_channels", 4)
+    out_channels = cfgs_diffusion.get("out_channels", 4)
+    sample_size = cfgs_diffusion.get("sample_size", 64)
     layers_per_block = cfgs_diffusion.get("layers_per_block", 2)
-    block_out_channels = cfgs_diffusion.get("block_out_channels", (64, 128, 256, 512))
+    attention_head_dim = cfgs_diffusion.get("attention_head_dim", 8)
+    dropout = cfgs_diffusion.get("dropout", 0.0)
+    cross_attention_dim = cfgs_diffusion.get("cross_attention_dim", None)
+    block_out_channels = cfgs_diffusion.get(
+        "block_out_channels", (320, 640, 1280, 1280)
+    )
     down_block_types = cfgs_diffusion.get(
         "down_block_types",
         (
-            "DownBlock2D",
-            "DownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
             "CrossAttnDownBlock2D",
             "DownBlock2D",
         ),
@@ -111,8 +117,8 @@ def main(args, resume_preempt=False):
         (
             "UpBlock2D",
             "CrossAttnUpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D",
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
         ),
     )
     scheduler_beta_start = cfgs_diffusion.get("scheduler_beta_start", 0.00085)
@@ -123,6 +129,14 @@ def main(args, resume_preempt=False):
     scheduler_prediction_type = cfgs_diffusion.get(
         "scheduler_prediction_type", "epsilon"
     )
+    do_latent_diffusion = cfgs_diffusion.get("do_latent_diffusion", True)
+    vae_model_id = cfgs_diffusion.get("vae_model_id", None)
+    assert not do_latent_diffusion or vae_model_id is not None, (
+        "VAE model must be provided if latent diffusion is enabled"
+    )
+    cross_attn_cond = cfgs_diffusion.get("cross_attn_cond", True)
+    in_concat_cond = cfgs_diffusion.get("in_concat_cond", False)
+    do_edm_style_training = cfgs_diffusion.get("do_edm_style_training", False)
 
     # -- DATA
     cfgs_data = args.get("data")
@@ -224,14 +238,14 @@ def main(args, resume_preempt=False):
         num_frames=num_frames,
         tubelet_size=tubelet_size,
         model_name=model_name,
-        # NOTE: crop_size are the size of the input to the encoder,
-        #       sample_size are the size of the input to the decoder.
         crop_size=crop_size,
-        sample_size=sample_size,
         use_sdpa=use_sdpa,
         in_channels=in_channels,
         out_channels=out_channels,
+        sample_size=sample_size,
         layers_per_block=layers_per_block,
+        attention_head_dim=attention_head_dim,
+        dropout=dropout,
         block_out_channels=block_out_channels,
         down_block_types=down_block_types,
         up_block_types=up_block_types,
@@ -239,6 +253,10 @@ def main(args, resume_preempt=False):
         scheduler_beta_end=scheduler_beta_end,
         scheduler_beta_schedule=scheduler_beta_schedule,
         scheduler_prediction_type=scheduler_prediction_type,
+        cross_attn_cond=cross_attn_cond,
+        cross_attention_dim=cross_attention_dim,
+        in_concat_cond=in_concat_cond,
+        do_edm_style_training=do_edm_style_training,
     )
     if gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -281,7 +299,7 @@ def main(args, resume_preempt=False):
         _dlen = unsupervised_loader.num_batches
     if ipe is None:
         ipe = _dlen
-    logger.info(f"iterations per epoch/dataest length: {ipe}/{_dlen}")
+    logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
 
     # -- init optimizer and scheduler
     optimizer, scaler, lr_scheduler = init_opt(
@@ -299,23 +317,25 @@ def main(args, resume_preempt=False):
 
     # -- freeze encoder
     for p in encoder.parameters():
-        p.requires_grad = False
+        p.requires_grad_(False)
 
     start_epoch = 0
 
     # -- load pre-trained encoder
     assert pre_train_model is not None, "Pre-trained encoder must be provided"
-    encoder = load_jepa_encoder(pre_train_model, encoder)
+    load_jepa_encoder(pre_train_model, encoder)
+
+    # -- load pre-trained vae
+    if do_latent_diffusion:
+        vae = get_pretrained_vae(vae_model_id, device)
+        vae.requires_grad_(False)
+
+        # The factor by which the image size is downsampled by the VAE
+        vae_downsample_factor = 2 ** (len(vae.config.block_out_channels) - 1)
 
     # -- load training checkpoint
     if load_model:
-        (
-            unet,
-            noise_scheduler,
-            optimizer,
-            scaler,
-            start_epoch,
-        ) = load_checkpoint(
+        start_epoch = load_checkpoint(
             r_path=load_path,
             unet=unet,
             noise_scheduler=noise_scheduler,
@@ -363,6 +383,18 @@ def main(args, resume_preempt=False):
                 loader = iter(unsupervised_loader)
                 udata = next(loader)
 
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler.sigmas.to(device=device, dtype=dtype)
+        schedule_timesteps = noise_scheduler.timesteps.to(device)
+        timesteps = timesteps.to(device)
+
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
         logger.info("Epoch %d" % (epoch + 1))
@@ -388,7 +420,7 @@ def main(args, resume_preempt=False):
 
             # -- unsupervised video clips
             # Put each clip on the GPU and concatenate along batch
-            # dimension, resulting in (B, C, L, H, W)
+            # dimension, resulting in (B, C, F, H, W)
             clips = torch.cat(
                 [u.to(device, non_blocking=True) for u in udata[0]], dim=0
             )
@@ -399,60 +431,142 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                    encoder_hidden_states = encoder(clips)
-                    encoder_hidden_states = F.layer_norm(
-                        encoder_hidden_states, (encoder_hidden_states.size(-1),)
+                    jepa_features = encoder(clips)
+                    jepa_features = F.layer_norm(
+                        jepa_features, (jepa_features.size(-1),)
                     )
 
                     # (B, L, D) -> (B * num_frames, L, D), L is the number of patches, D is the embedding dimension
-                    encoder_hidden_states = encoder_hidden_states.repeat_interleave(
-                        num_frames, dim=0
-                    )
+                    jepa_features = jepa_features.repeat_interleave(num_frames, dim=0)
 
-                    clean_images = clips.clone()
-                    clean_images = rearrange(clean_images, "b c f h w -> (b f) c h w")
-                    if crop_size != sample_size:
-                        clean_images = F.interpolate(
-                            clean_images, size=sample_size, mode="bilinear"
+                    # Denormalize clips to range [0, 1] & reshape to a larger batch of images
+                    images = denormalize_clips(clips)
+                    images = rearrange(images, "b c f h w -> (b f) c h w")
+
+                    # Normalize clips to range (-1, 1)
+                    images = images * 2.0 - 1.0
+
+                    # Convert images to latent space if a VAE encoder is provided
+                    if do_latent_diffusion:
+                        # Extrapolate the image size to make sure the latent's shape matches UNet's sample size
+                        images = F.interpolate(
+                            images,
+                            size=(
+                                sample_size * vae_downsample_factor,
+                                sample_size * vae_downsample_factor,
+                            ),
+                            mode="bilinear",
                         )
 
-                    # Sample noise that we'll add to the images
-                    noise = torch.randn_like(clean_images, dtype=dtype, device=device)
+                        latents = vae.encode(images).latent_dist.sample()
+                        latents = latents * vae.config.scaling_factor
+                    else:
+                        latents = images
 
-                    # NOTE: The batch size here is different from the batch size of the data loader.
-                    #       The precise batch size here is batch_size * num_frames.
-                    bsz = clean_images.shape[0]
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents, device=device)
 
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(
-                        0,
-                        noise_scheduler.config.num_train_timesteps,
-                        (bsz,),
-                        device=device,
-                    ).long()
+                    if not do_edm_style_training:
+                        # Sample a random timestep for each image
+                        timesteps = torch.randint(
+                            0,
+                            noise_scheduler.config.num_train_timesteps,
+                            (latents.shape[0],),
+                            device=device,
+                        ).long()
+                    else:
+                        # in EDM formulation, the model is conditioned on the pre-conditioned noise levels
+                        # instead of discrete timesteps, so here we sample indices to get the noise levels
+                        # from `scheduler.timesteps`
+                        indices = torch.randint(
+                            0,
+                            noise_scheduler.config.num_train_timesteps,
+                            (latents.shape[0],),
+                        )
+                        timesteps = noise_scheduler.timesteps[indices].to(device=device)
 
                     # Create class labels indicating which frame we are reconstructing
                     class_labels = torch.arange(num_frames, device=device)
+                    class_labels = class_labels.repeat(batch_size)
 
-                    # Add noise to the clean images
-                    noisy_images = noise_scheduler.add_noise(
-                        clean_images, noise, timesteps
-                    )
+                    # Add noise to the clean latents
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                    # For EDM-style training, we first obtain the sigmas based on the continuous timesteps.
+                    # We then precondition the final model inputs based on these sigmas instead of the timesteps.
+                    # Follow: Section 5 of https://huggingface.co/papers/2206.00364.
+                    if do_edm_style_training:
+                        sigmas = get_sigmas(
+                            timesteps,
+                            len(noisy_latents.shape),
+                            noisy_latents.dtype,
+                        )
+                        inp_noisy_latents = noise_scheduler.precondition_inputs(
+                            noisy_latents, sigmas
+                        )
+
+                    # Concatenate JEPA features with diffusion latent
+                    if in_concat_cond:
+                        jepa_cond = jepa_features.clone()
+                        jepa_cond = rearrange(
+                            jepa_cond,
+                            "b (t p1 p2) d -> b (t d) p1 p2",
+                            p1=crop_size // patch_size,
+                            p2=crop_size // patch_size,
+                        )
+                        jepa_cond = F.interpolate(
+                            jepa_cond,
+                            size=(noisy_latents.shape[2], noisy_latents.shape[3]),
+                            mode="bilinear",
+                        )
+                        latent_model_input = torch.cat(
+                            [
+                                jepa_cond,
+                                inp_noisy_latents
+                                if do_edm_style_training
+                                else noisy_latents,
+                            ],
+                            dim=1,
+                        )
+                    else:
+                        latent_model_input = (
+                            inp_noisy_latents
+                            if do_edm_style_training
+                            else noisy_latents
+                        )
 
                     # Get the model prediction
-                    noise_pred = unet(
-                        noisy_images,
-                        timesteps,
-                        encoder_hidden_states,
-                        class_labels,
-                        return_dict=False,
-                    )[0]
+                    if cross_attn_cond:
+                        model_pred = unet(
+                            sample=latent_model_input,
+                            timestep=timesteps,
+                            encoder_hidden_states=jepa_features,
+                            class_labels=class_labels,
+                            return_dict=False,
+                        )[0]
+                    else:
+                        model_pred = unet(
+                            sample=latent_model_input,
+                            timestep=timesteps,
+                            class_labels=class_labels,
+                            return_dict=False,
+                        )[0]
+
+                    if do_edm_style_training:
+                        # Similar to the input preconditioning, the model predictions are also preconditioned
+                        # on noised model inputs (before preconditioning) and the sigmas.
+                        # Follow: Section 5 of https://huggingface.co/papers/2206.00364.
+                        model_pred = noise_scheduler.precondition_outputs(
+                            noisy_latents, model_pred, sigmas
+                        )
 
                     if noise_scheduler.config.prediction_type == "epsilon":
-                        target = noise
+                        target = latents if do_edm_style_training else noise
                     elif noise_scheduler.config.prediction_type == "v_prediction":
-                        target = noise_scheduler.get_velocity(
-                            clean_images, noise, timesteps
+                        target = (
+                            latents
+                            if do_edm_style_training
+                            else noise_scheduler.get_velocity(latents, noise, timesteps)
                         )
                     else:
                         raise ValueError(
@@ -461,7 +575,7 @@ def main(args, resume_preempt=False):
 
                     # Compute the loss
                     loss = F.mse_loss(
-                        noise_pred.float(), target.float(), reduction="mean"
+                        model_pred.float(), target.float(), reduction="mean"
                     )
 
                 # Step 2. Backward & step
