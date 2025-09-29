@@ -61,9 +61,9 @@ def _build_policy_kwargs_for_jepa(policy_cfg: Dict[str, Any]) -> Dict[str, Any]:
     out["features_extractor_class"] = JEPAExtractor
     out["features_extractor_kwargs"] = fe_kwargs
 
-    # # forward optional policy knobs (if your policy consumes them)
-    # if "net_kwargs" in (policy_cfg or {}):
-    #     out["net_kwargs"] = dict(policy_cfg["net_kwargs"])
+    # forward optional policy knobs (if your policy consumes them)
+    if "net_kwargs" in (policy_cfg or {}):
+        out["net_kwargs"] = dict(policy_cfg["net_kwargs"])
     # if "ortho_init" in (policy_cfg or {}):
     #     out["ortho_init"] = bool(policy_cfg["ortho_init"])
 

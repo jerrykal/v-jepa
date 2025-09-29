@@ -48,8 +48,8 @@ ppo_training:
           complete_block: true
 
     net_kwargs:
-      hid_dim: 1024
-      num_layers: 3
+      hid_dim: 512
+      num_layers: 2
       activation: "silu"
       norm: "rmsnorm"
       share_backbone: false
