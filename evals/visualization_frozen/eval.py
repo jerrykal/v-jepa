@@ -317,7 +317,8 @@ def main(args_eval, resume_preempt=False):
                 z_ctx = z_list[0]
                 if autoregressive:
                     preds_tokens = [] 
-                    for _ in range(_t):
+                    preds_tokens.append(z_ctx[:, :_p])
+                    for _ in range(_t-1):
                         out_list = predictor([z_ctx], h, masks_e, masks_p, [None])
                         pred_tok = out_list[0]
                         preds_tokens.append(pred_tok)
