@@ -340,9 +340,9 @@ def main(args, resume_preempt=False):
     encoder = DistributedDataParallel(encoder)
     target_encoder = DistributedDataParallel(target_encoder)
 
-    if pre_train_model:
-        for p in encoder.parameters():
-            p.requires_grad = False
+    # if pre_train_model:
+    #     for p in encoder.parameters():
+    #         p.requires_grad = False
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -560,7 +560,7 @@ def main(args, resume_preempt=False):
                 grad_stats.global_norm = float(_enc_norm)
                 grad_stats_pred = grad_logger(predictor.named_parameters())
                 grad_stats_pred.global_norm = float(_pred_norm)
-                grad_stats_la_enc = grad_logger(predictor.named_parameters())
+                grad_stats_la_enc = grad_logger(latent_action_enc.named_parameters())
                 grad_stats_la_enc.global_norm = float(_la_norm)
                 optimizer.zero_grad()
                 optim_stats = adamw_logger(optimizer)
