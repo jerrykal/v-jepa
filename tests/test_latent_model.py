@@ -24,10 +24,10 @@ if __name__ == "__main__":
         d_codebook=d_codebook,
         inp_dims=D,
         n_codebook=1,
-        lfq_bias=True,
-        lfq_commit_weight=0.25,
-        lfq_entropy_weight=0.1,
-        lfq_diversity_weight=1.0,
+        vq_bias=True,
+        vq_commit_weight=0.25,
+        vq_entropy_weight=0.1,
+        vq_diversity_weight=1.0,
         quant_loss_weight=1.0
     ).to(device)
 

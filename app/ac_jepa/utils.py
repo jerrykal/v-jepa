@@ -12,6 +12,9 @@ import yaml
 
 
 import torch
+import torch.nn as nn
+
+from typing import Dict, List
 
 import src.models.vision_transformer as video_vit
 import src.models.predictor as vit_pred
@@ -21,51 +24,66 @@ from src.utils.schedulers import (
     WarmupCosineSchedule,
     CosineWDSchedule)
 from src.utils.tensors import trunc_normal_
+from src.utils.saveloader import load_component
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
-def load_jepa_encoder(
-    model_path,
-    encoder,
-    target_encoder,
-    predictor
+def _is_in_training(name: str, training_list: List[str]) -> bool:
+    for t in training_list:
+        if name == t or name.startswith(t + "."):
+            return True
+    return False
+
+def build_load_model_dict(
+    all_named_modules: Dict[str, nn.Module],
+    training_model_list: List[str],
+    trainable: bool = False,
+) -> Dict[str, nn.Module]:
+    unknown = [t for t in training_model_list
+               if not any(t == k or k.startswith(t + ".") for k in all_named_modules.keys())]
+    if unknown:
+        logger.warning(f"Unknown training names (ignored): {unknown}")
+
+    def _is_in_training(name: str) -> bool:
+        return any(name == t or name.startswith(t + ".") for t in training_model_list)
+
+    if trainable:
+        load_dict = {name: module for name, module in all_named_modules.items() if _is_in_training(name)}
+        logger.info(f"Selected trainable modules: {list(load_dict.keys())}")
+    else:
+        load_dict = {name: module for name, module in all_named_modules.items() if not _is_in_training(name)}
+        logger.info(f"Selected frozen (not trainable) modules: {list(load_dict.keys())}")
+
+    if not load_dict:
+        logger.warning("No modules matched the selection.")
+
+    return load_dict
+
+
+def load_pretrained_model(
+    model_path: str,
+    load_model_dict: dict[str, nn.Module],
+    *,
+    use_ddp: bool = False,
+    trainable: bool = False,
 ):
+
     try:
-        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+        checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
     except Exception as e:
         logger.info(f'Encountered exception when loading checkpoint: {e}')
-        return encoder, target_encoder
+        return load_model_dict
 
-    try:
-        # -- loading encoder
-        if 'encoder' in checkpoint:
-            pretrained_dict = checkpoint['encoder']
-            msg = encoder.load_state_dict(pretrained_dict)
-            logger.info(f'Loaded JEPA encoder with msg: {msg}')
-        else:
-            logger.warning('No "encoder" found in checkpoint.')
+    for name, module in load_model_dict.items():
+        try:
+            module = load_component(checkpoint, name, module, use_ddp)
+            for param in module.parameters():
+                param.requires_grad = trainable
+        except Exception as e:
+            logger.warning(f'[{name}] failed to load: {e}')
 
-        # -- loading target_encoder
-        if target_encoder is not None and 'target_encoder' in checkpoint:
-            pretrained_dict = checkpoint['target_encoder']
-            msg = target_encoder.load_state_dict(pretrained_dict)
-            logger.info(f'Loaded JEPA target_encoder with msg: {msg}')
-        else:
-            logger.warning('No "target_encoder" found in checkpoint.')
-
-        # -- loading predictor
-        if predictor is not None and 'predictor' in checkpoint:
-            pretrained_dict = checkpoint['predictor']
-            msg = predictor.load_state_dict(pretrained_dict, strict=False)
-            logger.info(f'Loaded JEPA predictor with msg: {msg}')
-        else:
-            logger.warning('No "predictor" found in checkpoint.')
-
-    except Exception as e:
-        logger.info(f'Failed to load JEPA encoder/target_encoder: {e}')
-
-    return encoder, target_encoder, predictor
+    return load_model_dict
 
 def load_checkpoint(
     r_path,
@@ -77,7 +95,7 @@ def load_checkpoint(
     scaler,
 ):
     try:
-        checkpoint = torch.load(r_path, map_location=torch.device('cpu'))
+        checkpoint = torch.load(r_path, map_location=torch.device('cpu'), weights_only=True)
     except Exception as e:
         logger.info(f'Encountered exception when loading checkpoint {e}')
 

@@ -38,7 +38,7 @@ world_model:
     num_heads: 8              # Attention heads
     d_codebook: 16             # Dimension per codebook (dims_action_codebook)
     n_codebook: 2             # Number of codebooks (number_action_codebook)
-    vq_bias: true             # LFQ bias
+    vq_bias: true             # vq bias
     vq_commit_weight: 0.25    # Commitment loss weight
     vq_entropy_weight: 0.1    # Entropy regularization weight
     vq_diversity_weight: 1.0  # Diversity regularization weight

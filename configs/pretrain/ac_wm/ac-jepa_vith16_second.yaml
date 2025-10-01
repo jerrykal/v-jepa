@@ -31,7 +31,7 @@ data_aug:
   reprob: 0.0
 
 logging:
-  folder: /home/cgv/Documents/project/EmbodiedAgent/v-jepa/logs/ac_wm
+  folder: /home/cgv/Documents/project/EmbodiedAgent/v-jepa/logs/ac_jepa_second
   write_tag: ac_jepa
 
 loss:
@@ -72,10 +72,11 @@ meta:
   eval_freq: 100
   use_sdpa: true
   dtype: bfloat16
-  pre_train_model: "/media/cgv/1tb_disk/vith16.pth.tar"
+  pre_train_model: "/home/cgv/Documents/project/EmbodiedAgent/v-jepa/logs/ac_wm/pretrain_ac-jepa-vitl16-100ep_q32-16/ac_jepa-latest.pth.tar"
+  second_stage: True
 
 model:
-  model_name: vit_huge
+  model_name: vit_large
   pred_depth: 12
   pred_embed_dim: 384
   uniform_power: true
@@ -83,13 +84,13 @@ model:
   zero_init_mask_tokens: true
   action_adapter_type: "Concat"
   latent_action_num_heads: 8
-  dims_aciton_codebook: 10
-  number_aciton_codebook: 1
-  lfq_bias: True
-  lfq_commit_weight: 0.25
-  lfq_entropy_weight: 0.1 
-  lfq_diversity_weight: 1.0
-  training_model_list: ["predictor", "latent_action_enc"]
+  dims_aciton_codebook: 32
+  number_aciton_codebook: 16
+  vq_bias: True
+  vq_commit_weight: 0.25
+  vq_entropy_weight: 0.1 
+  vq_diversity_weight: 1.0
+  training_model_list: ["predictor", "encoder","target_encoder"]
 
 optimization:
   ipe: 300
@@ -97,7 +98,7 @@ optimization:
   clip_grad: 10.0
   weight_decay: 0.04
   final_weight_decay: 0.4
-  epochs: 300
+  epochs: 100
   warmup: 40
   start_lr: 0.0002
   lr: 0.000625

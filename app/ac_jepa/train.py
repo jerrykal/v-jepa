@@ -46,7 +46,8 @@ from app.ac_jepa.utils import (
     init_video_model,
     init_latent_action_encoder,
     load_checkpoint,
-    load_jepa_encoder,
+    load_pretrained_model,
+    build_load_model_dict,
 )
 from app.ac_jepa.transforms import make_transforms
 
@@ -90,6 +91,7 @@ def main(args, resume_preempt=False):
         dtype = torch.float32
         mixed_precision = False
     pre_train_model = cfgs_meta.get('pre_train_model', None)
+    second_stage = cfgs_meta.get('second_stage', False)
 
     # -- MASK
     cfgs_mask = args.get('mask')
@@ -233,8 +235,7 @@ def main(args, resume_preempt=False):
         pred_depth=pred_depth,
         pred_embed_dim=pred_embed_dim,
         use_sdpa=use_sdpa,
-        adapter_type=action_adapter_type,
-        action_dim=dims_aciton_codebook
+        adapter_type=action_adapter_type
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -254,8 +255,9 @@ def main(args, resume_preempt=False):
 
     all_named_modules = {
         'encoder': encoder,
+        'target_encoder':target_encoder,
         'predictor': predictor,
-        'latent_action_enc': latent_action_enc,
+        'latent_action_encoder': latent_action_enc,
     }
 
     # -- make data transforms
@@ -314,7 +316,10 @@ def main(args, resume_preempt=False):
     logger.info(f'iterations per epoch/dataest length: {ipe}/{_dlen}')
 
     # -- init optimizer and scheduler
-    training_modules = [all_named_modules[name] for name in training_model_list if name in all_named_modules]
+    training_modules = [
+        all_named_modules[name] 
+        for name in training_model_list if name in all_named_modules
+    ]
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
         models=training_modules,
         wd=wd,
@@ -329,6 +334,7 @@ def main(args, resume_preempt=False):
         mixed_precision=mixed_precision,
         betas=betas,
         eps=eps)
+
     predictor = DistributedDataParallel(predictor, static_graph=True)
     latent_action_enc = DistributedDataParallel(latent_action_enc, static_graph=True)
     encoder = DistributedDataParallel(encoder)
@@ -347,8 +353,27 @@ def main(args, resume_preempt=False):
     start_epoch = 0
     # -- load training checkpoint
     if pre_train_model:
-        encoder, target_encoder, predictor = load_jepa_encoder(pre_train_model, encoder, target_encoder, predictor)
-
+        logger.info(f"Load pretrained checkpoint:{pre_train_model}")
+        _ = load_pretrained_model(
+            pre_train_model, 
+            build_load_model_dict(
+                all_named_modules=all_named_modules,
+                training_model_list=training_model_list,
+                trainable=False
+            ), 
+            use_ddp=False, trainable=False)
+        
+        if second_stage:
+            logger.info("Training second stage for encoder!")
+            _ = load_pretrained_model(
+                pre_train_model, 
+                build_load_model_dict(
+                    all_named_modules=all_named_modules,
+                    training_model_list=training_model_list,
+                    trainable=True
+                ), 
+                use_ddp=False, trainable=True)
+        
     if load_model or os.path.exists(latest_path):
         (
             encoder,
@@ -366,6 +391,7 @@ def main(args, resume_preempt=False):
             latent_action_enc=latent_action_enc,
             opt=optimizer,
             scaler=scaler)
+        
         for _ in range(start_epoch * ipe):
             scheduler.step()
             wd_scheduler.step()
@@ -540,10 +566,11 @@ def main(args, resume_preempt=False):
                 optim_stats = adamw_logger(optimizer)
 
                 # Step 3. momentum update of target encoder
-                m = next(momentum_scheduler)
-                with torch.no_grad():
-                    for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
-                        param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
+                if 'target_encoder' in training_model_list:
+                    m = next(momentum_scheduler)
+                    with torch.no_grad():
+                        for param_q, param_k in zip(encoder.parameters(), target_encoder.parameters()):
+                            param_k.data.mul_(m).add_((1.-m) * param_q.detach().data)
 
                 return (
                     float(loss),
