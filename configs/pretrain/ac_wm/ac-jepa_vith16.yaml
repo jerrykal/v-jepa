@@ -5,7 +5,7 @@ tasks_per_node: 8
 data:
   dataset_type: VideoDataset
   datasets:
-    - /media/cgv/1tb_disk/EmboodiedAgent/CLIP4MC_Dataset/export.csv
+    - /path/to/dataset csv
   decode_one_clip: true #not using
   batch_size: 24
   num_clips: 1
@@ -31,7 +31,7 @@ data_aug:
   reprob: 0.0
 
 logging:
-  folder: /home/cgv/Documents/project/EmbodiedAgent/v-jepa/logs/ac_wm
+  folder: logs/ac_wm
   write_tag: ac_jepa
 
 loss:
@@ -72,7 +72,7 @@ meta:
   eval_freq: 100
   use_sdpa: true
   dtype: bfloat16
-  pre_train_model: "/media/cgv/1tb_disk/vith16.pth.tar"
+  pre_train_model: "/path/to/pretrain mdoel" 
 
 model:
   model_name: vit_huge

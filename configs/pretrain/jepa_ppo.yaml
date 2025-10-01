@@ -32,7 +32,7 @@ ppo_training:
       kwargs:
         features_dim: 1024
         model_name: "vit_large"           
-        pretrain_path: "/media/cgv/1tb_disk/EmboodiedAgent/v-jepa/vitl16.pth.tar" 
+        pretrain_path: "/path/to/pretrain mdoel" 
         crop_size: 224
         patch_size: 16
         num_frames: 16

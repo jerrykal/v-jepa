@@ -73,7 +73,7 @@ optimizer_params = {
     "zero_init_bias_wd": False    # Apply weight decay to zero-initialized biases
 }
 
-pretrained_model_path = "/media/cgv/1tb_disk/download/ac_jepa-latest.pth.tar"
+pretrained_model_path = "/path/to/pretrain mdoel" 
 fine_tune = False
 tensor_logger = None  # TensorboardLogger(path="logs/")
 
@@ -107,7 +107,7 @@ replay_buffer = init_replay_buffer(
     max_length=int(1E5), warmup_length=50000, frame_skip=4,
     store_on_gpu=False,
 )
-replay_buffer.load_buffer("/home/cgv/Documents/project/EmbodiedAgent/v-jepa/test_1024.npz")
+replay_buffer.load_buffer("/path/to/buffer npz" )
 
 wm = init_world_model(
     device="cuda",
