@@ -307,7 +307,8 @@ def main(args_eval, resume_preempt=False):
     latent_action_enc.eval()
 
     with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-        first_batch = next(iter(eval_loader))[0]
+        eval_loader_iter = iter(eval_loader)
+        first_batch = next(eval_loader_iter)[0]
         clips = _extract_clips_from_batch(first_batch).to(device=device)
         B, C, T, H, W = clips.shape
         _t = T // tubelet_size
