@@ -15,17 +15,20 @@ eval_result/*
 # ckpt
 ckpt/*
 
+# data
+data/*
+
 # archive
 archive/*
 
 # vscode
 .vscode/*
 
+# Python virtual environment
+.venv
+
 # Other
 *.swp
 *.swo
 __pycache__
 .DS_Store
-
-
-
