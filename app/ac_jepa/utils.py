@@ -207,7 +207,7 @@ def init_video_model(
     num_mask_tokens=2,
     zero_init_mask_tokens=True,
     use_sdpa=False,
-    adapter_type="None",
+    adapter_type=None,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,

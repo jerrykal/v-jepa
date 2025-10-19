@@ -112,7 +112,7 @@ def main(args, resume_preempt=False):
     vq_entropy_weight = cfgs_model.get('vq_entropy_weight', 0.1)
     vq_diversity_weight = cfgs_model.get('vq_diversity_weight', 1.0)
     training_model_list = cfgs_model.get('training_model_list', ["encoder", "predictor", "latent_action_enc"])
-    action_adapter_type = cfgs_model.get('action_adapter_type', "None")
+    action_adapter_type = cfgs_model.get('action_adapter_type', None)
 
     # -- DATA
     cfgs_data = args.get('data')

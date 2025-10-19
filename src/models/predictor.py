@@ -58,23 +58,23 @@ class VisionTransformerPredictor(nn.Module):
         use_mask_tokens=False,
         num_mask_tokens=2,
         zero_init_mask_tokens=True,
-        **kwargs
+        adapter_type: str | None=None,
+        action_dim: int | None=None,
+        **kwargs,
     ):
         super().__init__()
-        self.action_adapter_type = kwargs.get("adapter_type", "None")
+        self.action_adapter_type = adapter_type
 
-        # Map input to predictor dimension
-        if self.action_adapter_type != "None":
+        if self.action_adapter_type is not None:
+            # Map input to predictor dimension
             self.predictor_context_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
             self.predictor_action_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
-        else:
-            self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
-        # Action input adapter
-        if self.action_adapter_type != "None":
-            self.action_dim = kwargs.get("action_dim")
+            # Action input adapter
+            self.action_dim = action_dim
             self.action_adapter = ConcatAdapter()
         else:
+            self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
             self.action_adapter = ActionAdapter()
 
         # Mask tokens
@@ -219,7 +219,7 @@ class VisionTransformerPredictor(nn.Module):
         B = len(ctxt) // len(masks_ctxt)
 
         # Map context tokens to pedictor dimensions
-        if self.action_adapter_type != "None":
+        if self.action_adapter_type is not None:
             x = self.predictor_context_embed(ctxt)
             if act is not None:
                 act = self.predictor_action_embed(act)
@@ -269,7 +269,7 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_norm(x)
 
         # Return output corresponding to target tokens
-        N_input = N_ctxt if self.action_adapter_type == "None" else N_ctxt+1
+        N_input = N_ctxt if self.action_adapter_type is None else N_ctxt+1
         x = x[:, N_input:]
         x = self.predictor_proj(x)
 
