@@ -7,41 +7,40 @@
 
 import logging
 import sys
-import warnings
-import yaml
 
-
+import src.models.predictor as vit_pred
+import src.models.vision_transformer as video_vit
 import torch
 import torch.nn as nn
-
-from typing import Dict, List
-
-import src.models.vision_transformer as video_vit
-import src.models.predictor as vit_pred
 from src.models.latent_action import LatentActionEncoder
-from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper, LatentActionEncoderMultiMaskWrapper
-from src.utils.schedulers import (
-    WarmupCosineSchedule,
-    CosineWDSchedule)
-from src.utils.tensors import trunc_normal_
+from src.models.utils.multimask import (
+    LatentActionEncoderMultiMaskWrapper,
+    MultiMaskWrapper,
+    PredictorMultiMaskWrapper,
+)
 from src.utils.saveloader import load_component
+from src.utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
+from src.utils.tensors import trunc_normal_
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
 
-def _is_in_training(name: str, training_list: List[str]) -> bool:
+
+def _is_in_training(name: str, training_list: list[str]) -> bool:
     for t in training_list:
         if name == t or name.startswith(t + "."):
             return True
     return False
 
+
 def build_load_model_dict(
-    all_named_modules: Dict[str, nn.Module],
-    training_model_list: List[str],
+    all_named_modules: dict[str, nn.Module],
+    training_model_list: list[str],
     trainable: bool = False,
-) -> Dict[str, nn.Module]:
-    unknown = [t for t in training_model_list
-               if not any(t == k or k.startswith(t + ".") for k in all_named_modules.keys())]
+) -> dict[str, nn.Module]:
+    unknown = [
+        t for t in training_model_list if not any(t == k or k.startswith(t + ".") for k in all_named_modules.keys())
+    ]
     if unknown:
         logger.warning(f"Unknown training names (ignored): {unknown}")
 
@@ -68,11 +67,10 @@ def load_pretrained_model(
     use_ddp: bool = False,
     trainable: bool = False,
 ):
-
     try:
-        checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
+        checkpoint = torch.load(model_path, map_location=torch.device("cpu"), weights_only=True)
     except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint: {e}')
+        logger.info(f"Encountered exception when loading checkpoint: {e}")
         return load_model_dict
 
     for name, module in load_model_dict.items():
@@ -81,9 +79,10 @@ def load_pretrained_model(
             for param in module.parameters():
                 param.requires_grad = trainable
         except Exception as e:
-            logger.warning(f'[{name}] failed to load: {e}')
+            logger.warning(f"[{name}] failed to load: {e}")
 
     return load_model_dict
+
 
 def load_checkpoint(
     r_path,
@@ -95,50 +94,48 @@ def load_checkpoint(
     scaler,
 ):
     try:
-        checkpoint = torch.load(r_path, map_location=torch.device('cpu'), weights_only=True)
+        checkpoint = torch.load(r_path, map_location=torch.device("cpu"), weights_only=True)
     except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint {e}')
+        logger.info(f"Encountered exception when loading checkpoint {e}")
 
     epoch = 0
     try:
-        epoch = checkpoint['epoch']
+        epoch = checkpoint["epoch"]
 
         # -- loading encoder
-        pretrained_dict = checkpoint['encoder']
+        pretrained_dict = checkpoint["encoder"]
         msg = encoder.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained encoder from epoch {epoch} with msg: {msg}')
+        logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
 
         # -- loading predictor
-        pretrained_dict = checkpoint['predictor']
+        pretrained_dict = checkpoint["predictor"]
         msg = predictor.load_state_dict(pretrained_dict)
-        logger.info(f'loaded pretrained predictor from epoch {epoch} with msg: {msg}')
+        logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
         # -- loading target_encoder
         if target_encoder is not None:
             print(list(checkpoint.keys()))
-            pretrained_dict = checkpoint['target_encoder']
+            pretrained_dict = checkpoint["target_encoder"]
             msg = target_encoder.load_state_dict(pretrained_dict)
-            logger.info(
-                f'loaded pretrained target encoder from epoch {epoch} with msg: {msg}'
-            )
+            logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
         # -- loading latent_action_encoder
-        if latent_action_enc is not None and 'latent_action_encoder' in checkpoint:
-            pretrained_dict = checkpoint['latent_action_encoder']
+        if latent_action_enc is not None and "latent_action_encoder" in checkpoint:
+            pretrained_dict = checkpoint["latent_action_encoder"]
             msg = latent_action_enc.load_state_dict(pretrained_dict)
-            logger.info(f'loaded pretrained latent_action_encoder from epoch {epoch} with msg: {msg}')
+            logger.info(f"loaded pretrained latent_action_encoder from epoch {epoch} with msg: {msg}")
         else:
-            logger.warning('latent_action_encoder not found in checkpoint or model is None.')
+            logger.warning("latent_action_encoder not found in checkpoint or model is None.")
 
         # -- loading optimizer
-        opt.load_state_dict(checkpoint['opt'])
+        opt.load_state_dict(checkpoint["opt"])
         if scaler is not None:
-            scaler.load_state_dict(checkpoint['scaler'])
-        logger.info(f'loaded optimizers from epoch {epoch}')
-        logger.info(f'read-path: {r_path}')
+            scaler.load_state_dict(checkpoint["scaler"])
+        logger.info(f"loaded optimizers from epoch {epoch}")
+        logger.info(f"read-path: {r_path}")
         del checkpoint
 
     except Exception as e:
-        logger.info(f'Encountered exception when loading checkpoint {e}')
+        logger.info(f"Encountered exception when loading checkpoint {e}")
         epoch = 0
 
     return (
@@ -151,19 +148,20 @@ def load_checkpoint(
         epoch,
     )
 
+
 def init_latent_action_encoder(
     device,
-    inp_dims: int = 192, 
+    inp_dims: int = 192,
     num_heads: int = 8,
     d_codebook: int = 10,
     n_codebook: int = 1,
     vq_bias: bool = True,
     vq_commit_weight: float = 0.25,
     vq_entropy_weight: float = 0.1,
-    vq_diversity_weight: float = 1.,
-    ):
+    vq_diversity_weight: float = 1.0,
+):
     la_enc = LatentActionEncoder(
-        input_dims=inp_dims, 
+        input_dims=inp_dims,
         num_heads=num_heads,
         d_codebook=d_codebook,
         n_codebook=n_codebook,
@@ -173,7 +171,7 @@ def init_latent_action_encoder(
         vq_diversity_weight=vq_diversity_weight,
     )
     la_enc = LatentActionEncoderMultiMaskWrapper(la_enc)
-    
+
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
             trunc_normal_(m.weight, std=0.02)
@@ -188,17 +186,20 @@ def init_latent_action_encoder(
 
     la_enc = la_enc.to(device)
     logger.info(la_enc)
+
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f'Predictor number of parameters: {count_parameters(la_enc)}')
+
+    logger.info(f"Predictor number of parameters: {count_parameters(la_enc)}")
     return la_enc
+
 
 def init_video_model(
     device,
     patch_size=16,
     num_frames=16,
     tubelet_size=2,
-    model_name='vit_base',
+    model_name="vit_base",
     crop_size=224,
     pred_depth=6,
     pred_embed_dim=384,
@@ -218,7 +219,7 @@ def init_video_model(
         use_sdpa=use_sdpa,
     )
     encoder = MultiMaskWrapper(encoder)
-    predictor = vit_pred.__dict__['vit_predictor'](
+    predictor = vit_pred.__dict__["vit_predictor"](
         img_size=crop_size,
         use_mask_tokens=use_mask_tokens,
         patch_size=patch_size,
@@ -260,13 +261,14 @@ def init_video_model(
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    logger.info(f'Encoder number of parameters: {count_parameters(encoder)}')
-    logger.info(f'Predictor number of parameters: {count_parameters(predictor)}')
+    logger.info(f"Encoder number of parameters: {count_parameters(encoder)}")
+    logger.info(f"Predictor number of parameters: {count_parameters(predictor)}")
 
     return encoder, predictor
 
+
 def init_opt(
-    models, 
+    models,
     iterations_per_epoch,
     start_lr,
     ref_lr,
@@ -284,18 +286,18 @@ def init_opt(
     param_groups = []
 
     for model in models:
-        param_groups.append({
-            'params': (p for n, p in model.named_parameters()
-                       if ('bias' not in n) and (len(p.shape) != 1))
-        })
-        param_groups.append({
-            'params': (p for n, p in model.named_parameters()
-                       if ('bias' in n) or (len(p.shape) == 1)),
-            'WD_exclude': zero_init_bias_wd,
-            'weight_decay': 0,
-        })
+        param_groups.append(
+            {"params": (p for n, p in model.named_parameters() if ("bias" not in n) and (len(p.shape) != 1))}
+        )
+        param_groups.append(
+            {
+                "params": (p for n, p in model.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
+                "WD_exclude": zero_init_bias_wd,
+                "weight_decay": 0,
+            }
+        )
 
-    logger.info('Using AdamW')
+    logger.info("Using AdamW")
     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
 
     total_steps = int(ipe_scale * num_epochs * iterations_per_epoch)
@@ -316,6 +318,6 @@ def init_opt(
         T_max=total_steps,
     )
 
-    scaler = torch.amp.GradScaler(device='cuda') if mixed_precision else None
+    scaler = torch.amp.GradScaler(device="cuda") if mixed_precision else None
 
     return optimizer, scaler, scheduler, wd_scheduler
