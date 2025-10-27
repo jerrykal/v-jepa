@@ -24,9 +24,6 @@ from app.ac_jepa.utils import (
 )
 from einops import rearrange
 from src.datasets.data_manager import init_data
-from src.masks.multiblock3d import MaskCollator as MB3DMaskCollator
-from src.masks.random_tube import MaskCollator as TubeMaskCollator
-from src.masks.utils import apply_masks
 from src.utils.distributed import AllReduce, init_distributed
 from src.utils.logging import (
     AverageMeter,
@@ -36,7 +33,6 @@ from src.utils.logging import (
     gpu_timer,
     grad_logger,
 )
-from src.utils.tensors import repeat_interleave_batch
 from torch.nn.parallel import DistributedDataParallel
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -89,8 +85,8 @@ def main(args, resume_preempt=False):
     else:
         dtype = torch.float32
         mixed_precision = False
-    pre_train_model = cfgs_meta.get('pre_train_model', None)
-    second_stage = cfgs_meta.get('second_stage', False)
+    pre_train_model = cfgs_meta.get("pre_train_model", None)
+    second_stage = cfgs_meta.get("second_stage", False)
 
     # -- MASK
     cfgs_mask = args.get("mask")
@@ -101,22 +97,18 @@ def main(args, resume_preempt=False):
     pred_depth = cfgs_model.get("pred_depth")
     pred_embed_dim = cfgs_model.get("pred_embed_dim")
     uniform_power = cfgs_model.get("uniform_power", True)
-    use_mask_tokens = cfgs_model.get("use_mask_tokens", True)
-    zero_init_mask_tokens = cfgs_model.get("zero_init_mask_tokens", True)
     la_enc_num_heads = cfgs_model.get("latent_action_num_heads", 8)
-    dims_aciton_codebook = cfgs_model.get("dims_aciton_codebook", 10)
-    number_aciton_codebook = cfgs_model.get("number_aciton_codebook", 1)
+    la_d_codebook = cfgs_model.get("dims_aciton_codebook", 10)
+    la_n_codebook = cfgs_model.get("number_aciton_codebook", 1)
     vq_bias = cfgs_model.get("vq_bias", True)
     vq_commit_weight = cfgs_model.get("vq_commit_weight", 0.25)
     vq_entropy_weight = cfgs_model.get("vq_entropy_weight", 0.1)
     vq_diversity_weight = cfgs_model.get("vq_diversity_weight", 1.0)
-    training_model_list = cfgs_model.get("training_model_list", ["encoder", "predictor", "latent_action_enc"])
-    action_adapter_type = cfgs_model.get("action_adapter_type", None)
+    training_model_list = cfgs_model.get("training_model_list", ["encoder", "ac_predictor", "latent_action_enc"])
 
     # -- DATA
     cfgs_data = args.get("data")
     dataset_type = cfgs_data.get("dataset_type", "videodataset")
-    mask_type = cfgs_data.get("mask_type", "multiblock3d")
     dataset_paths = cfgs_data.get("datasets", [])
     datasets_weights = cfgs_data.get("datasets_weights", None)
     if datasets_weights is not None:
@@ -129,6 +121,7 @@ def main(args, resume_preempt=False):
     duration = cfgs_data.get("clip_duration", None)
     crop_size = cfgs_data.get("crop_size", 224)
     patch_size = cfgs_data.get("patch_size")
+    num_patches_per_frame = (crop_size // patch_size) ** 2
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
     filter_short_videos = cfgs_data.get("filter_short_videos", False)
@@ -220,11 +213,8 @@ def main(args, resume_preempt=False):
     )
 
     # -- init model
-    encoder, predictor = init_video_model(
+    encoder, ac_predictor = init_video_model(
         uniform_power=uniform_power,
-        use_mask_tokens=use_mask_tokens,
-        num_mask_tokens=len(cfgs_mask),
-        zero_init_mask_tokens=zero_init_mask_tokens,
         device=device,
         patch_size=patch_size,
         num_frames=num_frames,
@@ -234,48 +224,32 @@ def main(args, resume_preempt=False):
         pred_depth=pred_depth,
         pred_embed_dim=pred_embed_dim,
         use_sdpa=use_sdpa,
-        adapter_type=action_adapter_type,
     )
     target_encoder = copy.deepcopy(encoder)
 
-    # -- init latnet action model
+    # -- init latent action model
     latent_action_enc = init_latent_action_encoder(
         device=device,
-        inp_dims=encoder.backbone.embed_dim,
+        input_dim=encoder.backbone.embed_dim,
+        num_patches_per_frame=num_patches_per_frame,
         num_heads=la_enc_num_heads,
-        d_codebook=dims_aciton_codebook,
-        n_codebook=number_aciton_codebook,
+        d_codebook=la_d_codebook,
+        n_codebook=la_n_codebook,
         vq_bias=vq_bias,
         vq_commit_weight=vq_commit_weight,
         vq_entropy_weight=vq_entropy_weight,
         vq_diversity_weight=vq_diversity_weight,
+        use_sdpa=use_sdpa,
     )
 
     all_named_modules = {
         "encoder": encoder,
         "target_encoder": target_encoder,
+        "ac_predictor": ac_predictor,
         "latent_action_encoder": latent_action_enc,
     }
 
     # -- make data transforms
-    if mask_type == "multiblock3d":
-        logger.info("Initializing basic multi-block mask")
-        mask_collator = MB3DMaskCollator(
-            crop_size=crop_size,
-            num_frames=num_frames,
-            patch_size=patch_size,
-            tubelet_size=tubelet_size,
-            cfgs_mask=cfgs_mask,
-        )
-    else:
-        logger.info("Initializing random tube mask")
-        mask_collator = TubeMaskCollator(
-            crop_size=crop_size,
-            num_frames=num_frames,
-            patch_size=patch_size,
-            tubelet_size=tubelet_size,
-            cfgs_mask=cfgs_mask,
-        )
     transform = make_transforms(
         random_horizontal_flip=True,
         random_resize_aspect_ratio=ar_range,
@@ -300,7 +274,7 @@ def main(args, resume_preempt=False):
         num_clips=num_clips,
         transform=transform,
         datasets_weights=datasets_weights,
-        collator=mask_collator,
+        collator=None,
         num_workers=num_workers,
         world_size=world_size,
         pin_mem=pin_mem,
@@ -333,7 +307,7 @@ def main(args, resume_preempt=False):
         eps=eps,
     )
 
-    predictor = DistributedDataParallel(predictor, static_graph=True)
+    ac_predictor = DistributedDataParallel(ac_predictor, static_graph=True)
     latent_action_enc = DistributedDataParallel(latent_action_enc, static_graph=True)
     encoder = DistributedDataParallel(encoder)
     target_encoder = DistributedDataParallel(target_encoder)
@@ -352,29 +326,29 @@ def main(args, resume_preempt=False):
     if pre_train_model:
         logger.info(f"Load pretrained checkpoint:{pre_train_model}")
         _ = load_pretrained_model(
-            pre_train_model, 
+            pre_train_model,
             build_load_model_dict(
-                all_named_modules=all_named_modules,
-                training_model_list=training_model_list,
-                trainable=False
-            ), 
-            use_ddp=False, trainable=False)
-        
+                all_named_modules=all_named_modules, training_model_list=training_model_list, trainable=False
+            ),
+            use_ddp=False,
+            trainable=False,
+        )
+
         if second_stage:
             logger.info("Training second stage for encoder!")
             _ = load_pretrained_model(
-                pre_train_model, 
+                pre_train_model,
                 build_load_model_dict(
-                    all_named_modules=all_named_modules,
-                    training_model_list=training_model_list,
-                    trainable=True
-                ), 
-                use_ddp=False, trainable=True)
-        
+                    all_named_modules=all_named_modules, training_model_list=training_model_list, trainable=True
+                ),
+                use_ddp=False,
+                trainable=True,
+            )
+
     if load_model or os.path.exists(latest_path):
         (
             encoder,
-            predictor,
+            ac_predictor,
             target_encoder,
             latent_action_enc,
             optimizer,
@@ -383,7 +357,7 @@ def main(args, resume_preempt=False):
         ) = load_checkpoint(
             r_path=load_path,
             encoder=encoder,
-            predictor=predictor,
+            ac_predictor=ac_predictor,
             target_encoder=target_encoder,
             latent_action_enc=latent_action_enc,
             opt=optimizer,
@@ -394,14 +368,13 @@ def main(args, resume_preempt=False):
             scheduler.step()
             wd_scheduler.step()
             next(momentum_scheduler)
-            mask_collator.step()
 
     def save_checkpoint(epoch, path):
         if rank != 0:
             return
         save_dict = {
             "encoder": encoder.state_dict(),
-            "predictor": predictor.state_dict(),
+            "ac_predictor": ac_predictor.state_dict(),
             "opt": optimizer.state_dict(),
             "scaler": None if scaler is None else scaler.state_dict(),
             "target_encoder": target_encoder.state_dict(),
@@ -445,7 +418,6 @@ def main(args, resume_preempt=False):
         jepa_loss_meter = AverageMeter()
         quant_loss_meter = AverageMeter()
         reg_loss_meter = AverageMeter()
-        mask_meters = [AverageMeter() for _ in range(len(cfgs_mask))]
         gpu_time_meter = AverageMeter()
         wall_time_meter = AverageMeter()
 
@@ -453,80 +425,55 @@ def main(args, resume_preempt=False):
             itr_start_time = time.time()
 
             try:
-                udata, masks_enc, masks_pred = next(loader)
+                udata = next(loader)
             except Exception:
                 logger.info("Exhausted data loaders. Refreshing...")
                 loader = iter(unsupervised_loader)
-                udata, masks_enc, masks_pred = next(loader)
-            assert len(masks_enc) == len(masks_pred), "Currently require num encoder masks = num predictor masks"
+                udata = next(loader)
 
-            def load_clips(udata=udata, masks_enc=masks_enc, masks_pred=masks_pred):
+            def load_clips(udata=udata):
                 # -- unsupervised video clips
                 # Put each clip on the GPU and concatenate along batch
                 # dimension
                 clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
 
-                # Put each mask-enc/mask-pred pair on the GPU and reuse the
-                # same mask pair for each clip
-                _masks_enc, _masks_pred = [], []
-                for _me, _mp in zip(masks_enc, masks_pred, strict=True):
-                    _me = _me.to(device, non_blocking=True)
-                    _mp = _mp.to(device, non_blocking=True)
-                    _me = repeat_interleave_batch(_me, batch_size, repeat=num_clips)
-                    _mp = repeat_interleave_batch(_mp, batch_size, repeat=num_clips)
-                    _masks_enc.append(_me)
-                    _masks_pred.append(_mp)
+                return clips
 
-                return (clips, _masks_enc, _masks_pred)
+            clips = load_clips()
 
-            clips, masks_enc, masks_pred = load_clips()
+            # Rearrange clips from (B, C, T, H, W) to (B * T, C, 2, H, W),
+            # flattening the temporal dimension into the batch so each frame can
+            # be processed independently as an image. This enables the JEPA encoder
+            # to operate over frames individually.
+            clips = rearrange(clips, "b c t h w -> (b t) c 1 h w").repeat(1, 1, 2, 1, 1)
 
-            for _i, m in enumerate(mask_meters):
-                m.update(masks_enc[_i][0].size(-1))
-
-            def train_step(epoch=epoch, clips=clips, masks_pred=masks_pred, masks_enc=masks_enc):
+            def train_step(epoch=epoch, clips=clips):
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
                 # --
 
-                def forward_target(c):
-                    """
-                    Returns list of tensors of shape [B, N, D], one for each
-                    mask-pred.
-                    """
+                def forward_targets(clips):
                     with torch.no_grad():
-                        h = target_encoder(c)
-                        h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim  [B, N, D]
-                        # -- create targets (masked regions of h)
-                        masked_h = apply_masks(h, masks_pred, concat=False)
-                        return masked_h, [h] * len(masks_pred)
+                        # Encode clips, then merge temporal dimension back with patch dimension
+                        targets = target_encoder(clips)
+                        targets = rearrange(targets, "(b t) p d -> b t p d", t=num_frames)
+                        targets = F.layer_norm(targets, (targets.size(-1),))  # normalize over feature-dim  [B, N, D]
 
-                def forward_action(h):
-                    x = [
-                        rearrange(
-                            _h, "B (t p) D -> B t p D", t=num_frames // tubelet_size, p=(crop_size // patch_size) ** 2
-                        )
-                        for _h in h
-                    ]
-                    results = latent_action_enc(x)
-                    act_list, loss_list = zip(*results, strict=True)
-                    return list(act_list), torch.stack(loss_list).mean()
+                        return targets
 
-                def forward_prediction(c, h, act):
-                    """
-                    Returns list of tensors of shape [B, N, D], one for each
-                    mask-pred.
-                    """
-                    z = encoder(c, masks_enc)
-                    z = predictor(z, h, masks_enc, masks_pred, act)
-                    return z
+                def forward_actions(targets):
+                    acts, loss_quant = latent_action_enc(targets)
+                    return acts, loss_quant
 
-                def loss_fn(z, h):
-                    loss = 0.0
-                    # Compute loss and accumulate for each mask-enc/mask-pred pair
-                    for zi, hi in zip(z, h, strict=True):
-                        loss += torch.mean(torch.abs(zi - hi) ** loss_exp) / loss_exp
-                    loss /= len(masks_pred)
+                def forward_predictions(targets, acts):
+                    preds = ac_predictor(targets, acts)
+                    preds = rearrange(preds, "b (t p) d -> b t p d", t=num_frames)
+                    return preds
+
+                def loss_fn(preds, targets):
+                    preds_shifted = preds[:, :-1]
+                    targets_shifted = targets[:, 1:]
+                    loss = torch.mean(torch.abs(preds_shifted - targets_shifted) ** loss_exp) / loss_exp
                     return loss
 
                 def reg_fn(z):
@@ -535,12 +482,14 @@ def main(args, resume_preempt=False):
                 # Step 1. Forward
                 loss_jepa, loss_reg = 0.0, 0.0
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    masked_h, h = forward_target(clips)
-                    act, loss_quant = forward_action(h)
-                    z = forward_prediction(clips, masked_h, act)
-                    loss_jepa = loss_fn(z, masked_h)  # jepa prediction loss
-                    pstd_z = reg_fn(z)  # predictor variance across patches
-                    loss_reg += torch.mean(F.relu(1.0 - pstd_z))
+                    targets = forward_targets(clips)
+                    acts, loss_quant = forward_actions(targets)
+                    preds = forward_predictions(targets, acts)
+
+                    loss_jepa = loss_fn(preds, targets)  # jepa prediction loss
+                    pstd_pred = reg_fn(preds)  # predictor variance across patches
+                    loss_reg += torch.mean(F.relu(1.0 - pstd_pred))
+
                 loss = loss_jepa + reg_coeff * loss_reg + loss_quant * quant_coeff
 
                 # Step 2. Backward & step
@@ -552,7 +501,7 @@ def main(args, resume_preempt=False):
                     loss.backward()
                 if (epoch > warmup) and (clip_grad is not None):
                     _enc_norm = torch.nn.utils.clip_grad_norm_(encoder.parameters(), clip_grad)
-                    _pred_norm = torch.nn.utils.clip_grad_norm_(predictor.parameters(), clip_grad)
+                    _pred_norm = torch.nn.utils.clip_grad_norm_(ac_predictor.parameters(), clip_grad)
                     _la_norm = torch.nn.utils.clip_grad_norm_(latent_action_enc.parameters(), clip_grad)
                 if mixed_precision:
                     scaler.step(optimizer)
@@ -561,7 +510,7 @@ def main(args, resume_preempt=False):
                     optimizer.step()
                 grad_stats = grad_logger(encoder.named_parameters())
                 grad_stats.global_norm = float(_enc_norm)
-                grad_stats_pred = grad_logger(predictor.named_parameters())
+                grad_stats_pred = grad_logger(ac_predictor.named_parameters())
                 grad_stats_pred.global_norm = float(_pred_norm)
                 grad_stats_la_enc = grad_logger(latent_action_enc.named_parameters())
                 grad_stats_la_enc.global_norm = float(_la_norm)
@@ -631,13 +580,12 @@ def main(args, resume_preempt=False):
             )
             if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
                 logger.info(
-                    f"[{epoch + 1},{itr:5d}] loss:{loss_meter.avg:.3f} | p:{jepa_loss_meter.avg:.3f} "
-                    f"q:{quant_loss_meter.avg:.3f} r:{reg_loss_meter.avg:.3f} | "
-                    f"var:{input_var_meter.avg:.3f} {input_var_min_meter.avg:.3f} | "
-                    f"masks:[{' '.join([f'{m.avg:.1f}' for m in mask_meters])}] "
-                    f"[wd:{_new_wd:.2e}] [lr:{_new_lr:.2e}] "
-                    f"[mem:{torch.cuda.max_memory_allocated() / 1024.0**2:.2e}] "
-                    f"[gpu:{gpu_time_meter.avg:.1f}ms] [wall:{wall_time_meter.avg:.1f}ms]"
+                    f"[{epoch + 1},{itr:5d}] loss: {loss_meter.avg:.3f} | p: {jepa_loss_meter.avg:.3f} "
+                    f"q: {quant_loss_meter.avg:.3f} r: {reg_loss_meter.avg:.3f} | "
+                    f"var: {input_var_meter.avg:.3f} {input_var_min_meter.avg:.3f} | "
+                    f"[wd: {_new_wd:.2e}] [lr: {_new_lr:.2e}] "
+                    f"[mem: {torch.cuda.max_memory_allocated() / 1024.0**2:.2e}] "
+                    f"[gpu: {gpu_time_meter.avg:.1f}ms] [wall: {wall_time_meter.avg:.1f}ms]"
                 )
 
                 if optim_stats is not None:

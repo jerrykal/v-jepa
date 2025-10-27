@@ -8,15 +8,13 @@
 import logging
 import sys
 
-import src.models.predictor as vit_pred
+import src.models.ac_predictor as vit_ac_pred
 import src.models.vision_transformer as video_vit
 import torch
 import torch.nn as nn
 from src.models.latent_action import LatentActionEncoder
 from src.models.utils.multimask import (
-    LatentActionEncoderMultiMaskWrapper,
     MultiMaskWrapper,
-    PredictorMultiMaskWrapper,
 )
 from src.utils.saveloader import load_component
 from src.utils.schedulers import CosineWDSchedule, WarmupCosineSchedule
@@ -87,7 +85,7 @@ def load_pretrained_model(
 def load_checkpoint(
     r_path,
     encoder,
-    predictor,
+    ac_predictor,
     target_encoder,
     latent_action_enc,
     opt,
@@ -108,9 +106,9 @@ def load_checkpoint(
         logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
 
         # -- loading predictor
-        pretrained_dict = checkpoint["predictor"]
-        msg = predictor.load_state_dict(pretrained_dict)
-        logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
+        pretrained_dict = checkpoint["ac_predictor"]
+        msg = ac_predictor.load_state_dict(pretrained_dict)
+        logger.info(f"loaded pretrained action-conditioned predictor from epoch {epoch} with msg: {msg}")
 
         # -- loading target_encoder
         if target_encoder is not None:
@@ -140,7 +138,7 @@ def load_checkpoint(
 
     return (
         encoder,
-        predictor,
+        ac_predictor,
         target_encoder,
         latent_action_enc,
         opt,
@@ -151,17 +149,20 @@ def load_checkpoint(
 
 def init_latent_action_encoder(
     device,
-    inp_dims: int = 192,
+    input_dim: int,
+    num_patches_per_frame: int,
+    d_codebook: int,
+    n_codebook: int,
     num_heads: int = 8,
-    d_codebook: int = 10,
-    n_codebook: int = 1,
     vq_bias: bool = True,
     vq_commit_weight: float = 0.25,
     vq_entropy_weight: float = 0.1,
     vq_diversity_weight: float = 1.0,
-):
+    use_sdpa: bool = True,
+) -> LatentActionEncoder:
     la_enc = LatentActionEncoder(
-        input_dims=inp_dims,
+        input_dim=input_dim,
+        num_patches_per_frame=num_patches_per_frame,
         num_heads=num_heads,
         d_codebook=d_codebook,
         n_codebook=n_codebook,
@@ -169,8 +170,8 @@ def init_latent_action_encoder(
         vq_commit_weight=vq_commit_weight,
         vq_entropy_weight=vq_entropy_weight,
         vq_diversity_weight=vq_diversity_weight,
+        use_sdpa=use_sdpa,
     )
-    la_enc = LatentActionEncoderMultiMaskWrapper(la_enc)
 
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
@@ -190,7 +191,7 @@ def init_latent_action_encoder(
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    logger.info(f"Predictor number of parameters: {count_parameters(la_enc)}")
+    logger.info(f"Latent action encoder number of parameters: {count_parameters(la_enc)}")
     return la_enc
 
 
@@ -204,11 +205,7 @@ def init_video_model(
     pred_depth=6,
     pred_embed_dim=384,
     uniform_power=False,
-    use_mask_tokens=False,
-    num_mask_tokens=2,
-    zero_init_mask_tokens=True,
     use_sdpa=False,
-    adapter_type=None,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -219,24 +216,19 @@ def init_video_model(
         use_sdpa=use_sdpa,
     )
     encoder = MultiMaskWrapper(encoder)
-    predictor = vit_pred.__dict__["vit_predictor"](
+    ac_predictor = vit_ac_pred.__dict__["vit_ac_predictor"](
         img_size=crop_size,
-        use_mask_tokens=use_mask_tokens,
         patch_size=patch_size,
         num_frames=num_frames,
-        tubelet_size=tubelet_size,
         embed_dim=encoder.backbone.embed_dim,
+        action_embed_dim=encoder.backbone.embed_dim,
         predictor_embed_dim=pred_embed_dim,
         depth=pred_depth,
         num_heads=encoder.backbone.num_heads,
         uniform_power=uniform_power,
-        num_mask_tokens=num_mask_tokens,
-        zero_init_mask_tokens=zero_init_mask_tokens,
         use_sdpa=use_sdpa,
-        adapter_type=adapter_type,
         action_dim=encoder.backbone.embed_dim,
     )
-    predictor = PredictorMultiMaskWrapper(predictor)
 
     def init_weights(m):
         if isinstance(m, torch.nn.Linear):
@@ -250,21 +242,21 @@ def init_video_model(
     for m in encoder.modules():
         init_weights(m)
 
-    for m in predictor.modules():
+    for m in ac_predictor.modules():
         init_weights(m)
 
     encoder.to(device)
-    predictor.to(device)
+    ac_predictor.to(device)
     logger.info(encoder)
-    logger.info(predictor)
+    logger.info(ac_predictor)
 
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     logger.info(f"Encoder number of parameters: {count_parameters(encoder)}")
-    logger.info(f"Predictor number of parameters: {count_parameters(predictor)}")
+    logger.info(f"Predictor number of parameters: {count_parameters(ac_predictor)}")
 
-    return encoder, predictor
+    return encoder, ac_predictor
 
 
 def init_opt(

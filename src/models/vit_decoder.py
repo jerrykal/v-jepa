@@ -2,9 +2,8 @@
 
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import Block
-
 from src.models.utils.pos_embs import get_3d_sincos_pos_embed
+from timm.models.vision_transformer import Block
 
 
 class ViTVideoDecoder(nn.Module):
@@ -43,12 +42,8 @@ class ViTVideoDecoder(nn.Module):
         super().__init__()
 
         num_patches = (num_frames // tubelet_size) * (img_size // patch_size) ** 2
-        self.in_proj = (
-            nn.Linear(in_dim, embed_dim) if in_dim != embed_dim else nn.Identity()
-        )
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches, embed_dim), requires_grad=False
-        )
+        self.in_proj = nn.Linear(in_dim, embed_dim) if in_dim != embed_dim else nn.Identity()
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim), requires_grad=False)
         self.blocks = nn.Sequential(
             *[
                 Block(
@@ -62,14 +57,10 @@ class ViTVideoDecoder(nn.Module):
             ]
         )
         self.norm = norm_layer(embed_dim)
-        self.out_proj = nn.Linear(
-            embed_dim, tubelet_size * (patch_size**2) * in_channels, bias=True
-        )
+        self.out_proj = nn.Linear(embed_dim, tubelet_size * (patch_size**2) * in_channels, bias=True)
 
         # Initialize weights
-        self._init_pos_embed(
-            embed_dim, img_size // patch_size, num_frames // tubelet_size
-        )
+        self._init_pos_embed(embed_dim, img_size // patch_size, num_frames // tubelet_size)
         self.apply(self._init_weights)
 
     def _init_pos_embed(self, embed_dim: int, grid_size: int, grid_depth: int) -> None:

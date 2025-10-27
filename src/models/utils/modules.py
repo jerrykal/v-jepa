@@ -15,6 +15,20 @@ from einops import einsum, rearrange, repeat
 from torch import Tensor
 
 
+def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
+    N_T = add_tokens + (H * W)
+    N = T * N_T
+    mask = torch.zeros(N, N).bool()
+    mask_block = torch.ones(N_T, N_T).bool()
+    local_window_time = T
+
+    for t1 in range(T):
+        for t2 in range(max(0, t1 - local_window_time + 1), t1 + 1):
+            mask[t1 * N_T : (t1 + 1) * N_T, t2 * N_T : (t2 + 1) * N_T] = mask_block
+
+    return mask
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -190,8 +204,8 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, return_attention=False, mask=None):
-        y, attn = self.attn(self.norm1(x), mask=mask)
+    def forward(self, x, return_attention=False, mask=None, attn_mask=None):
+        y, attn = self.attn(self.norm1(x), mask=mask, attn_mask=attn_mask)
         if return_attention:
             return attn
         x = x + y

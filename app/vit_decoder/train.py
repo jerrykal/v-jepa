@@ -13,10 +13,6 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-from torch.nn.parallel import DistributedDataParallel
-
 from app.vit_decoder.transforms import (
     make_eval_transforms,
     make_train_transforms,
@@ -29,6 +25,8 @@ from app.vit_decoder.utils import (
     load_jepa_encoder,
     unpatchify,
 )
+from einops import rearrange
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from src.datasets.data_manager import init_data
 from src.utils.distributed import AllReduce, init_distributed
 from src.utils.logging import (
@@ -40,6 +38,7 @@ from src.utils.logging import (
     grad_logger,
 )
 from src.utils.loss import PerceptualLoss
+from torch.nn.parallel import DistributedDataParallel
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
@@ -92,6 +91,9 @@ def main(args, resume_preempt=False):
     else:
         dtype = torch.float32
         mixed_precision = False
+
+    # TODO: make this an config option
+    encode_frames_independently = True
 
     # -- MODEL
     cfgs_model = args.get("model")
@@ -223,6 +225,7 @@ def main(args, resume_preempt=False):
         decoder_num_heads=decoder_num_heads,
         decoder_mlp_ratio=decoder_mlp_ratio,
         decoder_norm_layer=nn.LayerNorm,
+        encode_frames_independently=encode_frames_independently,
     )
 
     # -- make data transforms
@@ -317,7 +320,7 @@ def main(args, resume_preempt=False):
 
     # -- load training checkpoint
     if load_model:
-        epoch = load_checkpoint(
+        start_epoch = load_checkpoint(
             r_path=load_path,
             decoder=decoder,
             opt=optimizer,
@@ -366,7 +369,7 @@ def main(args, resume_preempt=False):
     best_psnr = float("-inf")
     best_ssim = float("-inf")
     for epoch in range(start_epoch, num_epochs):
-        logger.info("Epoch %d" % (epoch + 1))
+        logger.info(f"Epoch {epoch + 1}")
 
         # -- update distributed-data-loader epoch
         train_sampler.set_epoch(epoch)
@@ -392,40 +395,48 @@ def main(args, resume_preempt=False):
             # -- unsupervised video clips
             # Put each clip on the GPU and concatenate along batch
             # dimension, resulting in (B, C, F, H, W)
-            clips = torch.cat(
-                [u.to(device, non_blocking=True) for u in udata[0]], dim=0
-            )
+            clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
 
-            def train_step():
+            if encode_frames_independently:
+                # Rearrange clips from (B, C, T, H, W) to (B * T, C, 2, H, W),
+                # flattening the temporal dimension into the batch so each frame can
+                # be processed independently as an image. This enables the JEPA encoder
+                # to operate over frames individually.
+                x = rearrange(clips, "b c t h w -> (b t) c 1 h w").repeat(1, 1, 2, 1, 1)
+            else:
+                x = clips
+
+            def train_step(clips=clips, x=x):
                 lr_scheduler.step()
                 _new_lr = lr_scheduler.get_last_lr()[0]
 
                 # Step 1. Forward
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-                    # Encode video clips
-                    jepa_features = encoder(clips)
-                    jepa_features = F.layer_norm(
-                        jepa_features, (jepa_features.size(-1),)
-                    )
+                    # Encode video
+                    jepa_features = encoder(x)
+                    jepa_features = F.layer_norm(jepa_features, (jepa_features.size(-1),))
+                    if encode_frames_independently:
+                        jepa_features = rearrange(jepa_features, "(b t) p d -> b (t p) d", b=clips.size(0))
 
                     # Reconstruct video clips from encoded representations
-                    pred = decoder(jepa_features)
-
-                    pred = unpatchify(
-                        pred, crop_size, num_frames, patch_size, tubelet_size
+                    preds = decoder(jepa_features)
+                    preds = unpatchify(
+                        preds,
+                        crop_size,
+                        num_frames,
+                        patch_size,
+                        tubelet_size if not encode_frames_independently else 1,
                     )
-                    pred = rearrange(pred, "b c f h w -> (b f) c h w")
-                    target = rearrange(clips, "b c f h w -> (b f) c h w")
 
                     # Pixel-wise MSE loss
-                    reconstruction_loss = F.mse_loss(pred, target, reduction="mean")
+                    reconstruction_loss = F.mse_loss(preds, clips, reduction="mean")
 
                     # Perceptual loss
                     perceptual_loss = 0.0
                     if perceptual_loss_weight > 0.0:
-                        perceptual_loss = perceptual_loss_weight * perceptual_loss_fn(
-                            pred, target
-                        )
+                        preds = rearrange(preds, "b c t h w -> (b t) c h w")
+                        targets = rearrange(clips, "b c t h w -> (b t) c h w")
+                        perceptual_loss = perceptual_loss_weight * perceptual_loss_fn(preds, targets)
 
                     loss = reconstruction_loss + perceptual_loss
 
@@ -437,9 +448,7 @@ def main(args, resume_preempt=False):
                 else:
                     loss.backward()
                 if clip_grad is not None:
-                    _dec_norm = nn.utils.clip_grad_norm_(
-                        decoder.parameters(), clip_grad
-                    )
+                    _dec_norm = nn.utils.clip_grad_norm_(decoder.parameters(), clip_grad)
                 if mixed_precision:
                     scaler.step(optimizer)
                     scaler.update()
@@ -474,84 +483,53 @@ def main(args, resume_preempt=False):
             loss_meter.update(loss)
             reconstruction_loss_meter.update(reconstruction_loss)
             perceptual_loss_meter.update(perceptual_loss)
-            input_var = float(
-                AllReduce.apply(clips.view(clips.shape[0], -1).var(dim=1).mean(dim=0))
-            )
-            input_var_min = float(
-                AllReduce.apply(torch.min(clips.view(clips.shape[0], -1).var(dim=1)))
-            )
+            input_var = float(AllReduce.apply(clips.view(clips.shape[0], -1).var(dim=1).mean(dim=0)))
+            input_var_min = float(AllReduce.apply(torch.min(clips.view(clips.shape[0], -1).var(dim=1))))
             input_var_meter.update(input_var)
             input_var_min_meter.update(input_var_min)
             gpu_time_meter.update(gpu_etime_ms)
             wall_time_meter.update(iter_elapsed_time_ms)
 
             # -- Logging
-            def log_stats():
-                train_csv_logger.log(
-                    epoch + 1,
-                    itr,
-                    loss,
-                    reconstruction_loss,
-                    perceptual_loss,
-                    grad_stats.global_norm,
-                    gpu_etime_ms,
-                    iter_elapsed_time_ms,
+            train_csv_logger.log(
+                epoch + 1,
+                itr,
+                loss,
+                reconstruction_loss,
+                perceptual_loss,
+                grad_stats.global_norm,
+                gpu_etime_ms,
+                iter_elapsed_time_ms,
+            )
+            if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+                logger.info(
+                    f"[{epoch + 1}, {itr:5d}] loss: {loss_meter.avg:.3f} | "
+                    f"reconstruction_loss: {reconstruction_loss_meter.avg:.3f} | "
+                    f"perceptual_loss: {perceptual_loss_meter.avg:.3f} | "
+                    f"input_var: {input_var_meter.avg:.3f} {input_var_min_meter.avg:.3f} | "
+                    f"[lr: {_new_lr:.2e}] "
+                    f"[mem: {torch.cuda.max_memory_allocated() / 1024.0**2:.2e}] "
+                    f"[gpu: {gpu_time_meter.avg:.1f} ms]"
+                    f"[wall: {wall_time_meter.avg:.1f} ms]"
                 )
-                if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
+
+                if optim_stats is not None:
                     logger.info(
-                        "[%d, %5d] loss: %.3f | reconstruction_loss: %.3f | perceptual_loss: %.3f | "
-                        "input_var: %.3f %.3f | "
-                        "[lr: %.2e] "
-                        "[mem: %.2e] "
-                        "[gpu: %.1f ms]"
-                        "[wall: %.1f ms]"
-                        % (
-                            epoch + 1,
-                            itr,
-                            loss_meter.avg,
-                            reconstruction_loss_meter.avg,
-                            perceptual_loss_meter.avg,
-                            input_var_meter.avg,
-                            input_var_min_meter.avg,
-                            _new_lr,
-                            torch.cuda.max_memory_allocated() / 1024.0**2,
-                            gpu_time_meter.avg,
-                            wall_time_meter.avg,
-                        )
+                        f"[{epoch + 1}, {itr:5d}] first moment: {optim_stats.get('exp_avg').avg:.2e} "
+                        f"[{optim_stats.get('exp_avg').min:.2e} {optim_stats.get('exp_avg').max:.2e}] "
+                        f"second moment: {optim_stats.get('exp_avg_sq').avg:.2e} "
+                        f"[{optim_stats.get('exp_avg_sq').min:.2e} {optim_stats.get('exp_avg_sq').max:.2e}]"
                     )
 
-                    if optim_stats is not None:
-                        logger.info(
-                            "[%d, %5d] first moment: %.2e [%.2e %.2e] second moment: %.2e [%.2e %.2e]"
-                            % (
-                                epoch + 1,
-                                itr,
-                                optim_stats.get("exp_avg").avg,
-                                optim_stats.get("exp_avg").min,
-                                optim_stats.get("exp_avg").max,
-                                optim_stats.get("exp_avg_sq").avg,
-                                optim_stats.get("exp_avg_sq").min,
-                                optim_stats.get("exp_avg_sq").max,
-                            )
-                        )
+                if grad_stats is not None:
+                    logger.info(
+                        f"[{epoch + 1}, {itr:5d}] dec_grad_stats: "
+                        f"f/l[{grad_stats.first_layer:.2e} {grad_stats.last_layer:.2e}] "
+                        f"mn/mx({grad_stats.min:.2e}, {grad_stats.max:.2e}) {grad_stats.global_norm:.2e}"
+                    )
 
-                    if grad_stats is not None:
-                        logger.info(
-                            "[%d, %5d] dec_grad_stats: f/l[%.2e %.2e] mn/mx(%.2e, %.2e) %.2e"
-                            % (
-                                epoch + 1,
-                                itr,
-                                grad_stats.first_layer,
-                                grad_stats.last_layer,
-                                grad_stats.min,
-                                grad_stats.max,
-                                grad_stats.global_norm,
-                            )
-                        )
-
-            log_stats()
             assert not np.isnan(loss), "loss is nan"
-        logger.info("avg. loss %.3f" % loss_meter.avg)
+        logger.info(f"avg. loss {loss_meter.avg:.3f}")
 
         # -- EVALUATION
         if eval_freq > 0 and (epoch + 1) % eval_freq == 0:
@@ -564,16 +542,28 @@ def main(args, resume_preempt=False):
 
             with torch.no_grad():
                 for udata in eval_loader:
-                    clips = torch.cat(
-                        [u.to(device, non_blocking=True) for u in udata[0]], dim=0
-                    )
-                    jepa_features = encoder(clips)
-                    jepa_features = F.layer_norm(
-                        jepa_features, (jepa_features.size(-1),)
-                    )
+                    clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
+                    if encode_frames_independently:
+                        # Rearrange clips from (B, C, T, H, W) to (B * T, C, 2, H, W),
+                        # flattening the temporal dimension into the batch so each frame can
+                        # be processed independently as an image. This enables the JEPA encoder
+                        # to operate over frames individually.
+                        x = rearrange(clips, "b c t h w -> (b t) c 1 h w").repeat(1, 1, 2, 1, 1)
+                    else:
+                        x = clips
+
+                    jepa_features = encoder(x)
+                    jepa_features = F.layer_norm(jepa_features, (jepa_features.size(-1),))
+                    if encode_frames_independently:
+                        jepa_features = rearrange(jepa_features, "(b t) p d -> b (t p) d", b=clips.size(0))
+
                     preds = decoder(jepa_features)
                     preds = unpatchify(
-                        preds, crop_size, num_frames, patch_size, tubelet_size
+                        preds,
+                        crop_size,
+                        num_frames,
+                        patch_size,
+                        tubelet_size if not encode_frames_independently else 1,
                     )
 
                     targets = unnormalize_tensor(clips)
@@ -586,11 +576,9 @@ def main(args, resume_preempt=False):
                     target_np = targets.cpu().numpy()
                     pred_np = preds.cpu().numpy()
 
-                    for target, pred in zip(target_np, pred_np):
+                    for target, pred in zip(target_np, pred_np, strict=False):
                         psnr = peak_signal_noise_ratio(target, pred, data_range=1.0)
-                        ssim = structural_similarity(
-                            target, pred, data_range=1.0, channel_axis=2
-                        )
+                        ssim = structural_similarity(target, pred, data_range=1.0, channel_axis=2)
                         eval_psnr_meter.update(psnr)
                         eval_ssim_meter.update(ssim)
 
@@ -600,21 +588,15 @@ def main(args, resume_preempt=False):
                 eval_psnr_meter.avg,
                 eval_ssim_meter.avg,
             )
-            logger.info(
-                f"Evaluation PSNR: {eval_psnr_meter.avg:.3f}, SSIM: {eval_ssim_meter.avg:.3f}"
-            )
+            logger.info(f"Evaluation PSNR: {eval_psnr_meter.avg:.3f}, SSIM: {eval_ssim_meter.avg:.3f}")
 
             # Saving best checkpoint
             if eval_psnr_meter.avg > best_psnr:
-                logger.info(
-                    f"New best evaluation PSNR: {eval_psnr_meter.avg:.3f}, saving..."
-                )
+                logger.info(f"New best evaluation PSNR: {eval_psnr_meter.avg:.3f}, saving...")
                 best_psnr = eval_psnr_meter.avg
                 save_checkpoint(epoch + 1, best_psnr_path)
             if eval_ssim_meter.avg > best_ssim:
-                logger.info(
-                    f"New best evaluation SSIM: {eval_ssim_meter.avg:.3f}, saving..."
-                )
+                logger.info(f"New best evaluation SSIM: {eval_ssim_meter.avg:.3f}, saving...")
                 best_ssim = eval_ssim_meter.avg
                 save_checkpoint(epoch + 1, best_ssim_path)
 
