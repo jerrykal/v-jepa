@@ -26,7 +26,6 @@ class LatentActionEncoder(nn.Module):
         vq_commit_weight: float = 0.25,
         vq_entropy_weight: float = 0.1,
         vq_diversity_weight: float = 1.0,
-        quant_loss_weight: float = 1.0,
         use_sdpa=True,
     ) -> None:
         super().__init__()
@@ -76,7 +75,6 @@ class LatentActionEncoder(nn.Module):
 
         self.d_codebook = d_codebook
         self.n_codebook = n_codebook
-        self.quant_loss_weight = quant_loss_weight
 
     def encode(self, x: Tensor) -> tuple[Tensor, dict]:
         """
@@ -100,7 +98,7 @@ class LatentActionEncoder(nn.Module):
         # 3. Quantize latent action
         (z_q, _), q_loss = self.quant(h)  # z_q: [B, T, 1, D]
 
-        loss = (q_loss * self.quant_loss_weight) if self.training else 0
+        loss = q_loss if self.training else 0
         return z_q, loss
 
     def forward(self, x: Tensor) -> tuple[Tensor, dict]:
