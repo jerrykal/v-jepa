@@ -369,9 +369,14 @@ def main(args_eval, resume_preempt=False):
         vid_targets = _to_uint8_video(targets_np[0])
         vid_compare = _side_by_side(vid_pred, vid_targets)
 
+        vid_full_pred = np.concatenate([vid_contexts, vid_pred], axis=0)
+        vid_full_targets = np.concatenate([vid_contexts, vid_targets], axis=0)
+        vid_full_compare = _side_by_side(vid_full_pred, vid_full_targets)
+
         # Save gif
         fps = 4
         _write_gif(os.path.join(results_dir, "pred"), f"{stem_base}", vid_pred, fps=fps, loop=0)
         _write_gif(os.path.join(results_dir, "contexts"), f"{stem_base}", vid_contexts, fps=fps, loop=0)
         _write_gif(os.path.join(results_dir, "targets"), f"{stem_base}", vid_targets, fps=fps, loop=0)
         _write_gif(os.path.join(results_dir, "compare"), f"{stem_base}", vid_compare, fps=fps, loop=0)
+        _write_gif(os.path.join(results_dir, "full_compare"), f"{stem_base}", vid_full_compare, fps=fps, loop=0)
