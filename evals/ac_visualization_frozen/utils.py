@@ -4,39 +4,34 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
+import copy
 import os
+from glob import glob
+
+import src.models.ac_predictor as vit_ac_pred
+import src.models.vision_transformer as video_vit
 import torch
 import torch.nn as nn
-import copy
-from torch.nn.parallel import DistributedDataParallel
-
-import logging
 import yaml
-
-import src.models.vision_transformer as video_vit
-import src.models.predictor as vit_pred
-
-from glob import glob
 from einops import rearrange
 from src.models.latent_action import LatentActionEncoder
-from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper, LatentActionEncoderMultiMaskWrapper
+from src.models.utils.multimask import MultiMaskWrapper, PredictorMultiMaskWrapper
 from src.models.vit_decoder import ViTVideoDecoder
-from src.utils.tensors import trunc_normal_
-
-from src.utils.logging import (
-    get_logger
-)
+from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+
 def _load_yaml(path):
-    with open(path, "r") as f:
+    with open(path) as f:
         return yaml.safe_load(f)
-    
+
+
 def _join_if_relative(base, maybe_path):
     if not maybe_path:
         return None
     return maybe_path if os.path.isabs(maybe_path) else os.path.join(base, maybe_path)
+
 
 def _find_ckpt_file(base_dir):
     """
@@ -49,11 +44,14 @@ def _find_ckpt_file(base_dir):
         cands += glob(os.path.join(base_dir, pat))
     if not cands:
         return None
+
     def _score(p):
         name = os.path.basename(p).lower()
         pref = 2 if "best" in name else (1 if ("final" in name or "last" in name) else 0)
         return (pref, os.path.getmtime(p))
+
     return sorted(cands, key=_score, reverse=True)[0]
+
 
 def merge_eval_args_with_components(args_eval):
     """
@@ -72,7 +70,7 @@ def merge_eval_args_with_components(args_eval):
     assert os.path.exists(ac_yaml), f"Missing {ac_yaml}"
     assert os.path.exists(dec_yaml), f"Missing {dec_yaml}"
 
-    ac_cfg  = _load_yaml(ac_yaml)    # {app,data,model,mask,meta,...}
+    ac_cfg = _load_yaml(ac_yaml)  # {app,data,model,mask,meta,...}
     dec_cfg = _load_yaml(dec_yaml)
 
     # Resolve ckpt files
@@ -96,16 +94,15 @@ def merge_eval_args_with_components(args_eval):
 
     # Merge sections back to args_eval for the rest of your code:
     # Data: prefer AC for core geometry (num_frames/patch/tubelet/crop); decoder for eval_datasets
-    ac_data  = ac_cfg.get("data", {})
+    ac_data = ac_cfg.get("data", {})
     dec_data = dec_cfg.get("data", {})
     user_data = args_eval.get("data", {})
     merged_data = {**dec_data, **ac_data, **user_data}
     if user_data.get("eval_datasets"):
         merged_data["eval_datasets"] = user_data["eval_datasets"]
 
-
     # Model: prefer AC for predictor/action; decoder for decoder hyperparams
-    ac_model  = ac_cfg.get("model", {})
+    ac_model = ac_cfg.get("model", {})
     dec_model = dec_cfg.get("model", {})
     merged_model = {**dec_model, **ac_model}
     merged_model["ac_jepa_pth"] = ac_pth
@@ -118,16 +115,18 @@ def merge_eval_args_with_components(args_eval):
     merged_meta = {**dec_cfg.get("meta", {}), **ac_cfg.get("meta", {}), **args_eval.get("meta", {})}
 
     # Write back
-    args_eval["data"]  = merged_data
+    args_eval["data"] = merged_data
     args_eval["model"] = merged_model
-    args_eval["mask"]  = merged_mask
-    args_eval["meta"]  = merged_meta
+    args_eval["mask"] = merged_mask
+    args_eval["meta"] = merged_meta
 
     # Also return raw yaml dicts if needed
     return args_eval, ac_cfg, dec_cfg
 
+
 def _strip_module_prefix(sd):
-    return { (k[7:] if k.startswith("module.") else k): v for k, v in sd.items() }
+    return {(k[7:] if k.startswith("module.") else k): v for k, v in sd.items()}
+
 
 def _load_component(checkpoint, name, model, use_ddp):
     """
@@ -155,12 +154,13 @@ def _load_component(checkpoint, name, model, use_ddp):
             #   non-DDP module param names.
             ckpt = checkpoint[name] if use_ddp else _strip_module_prefix(checkpoint[name])
             msg = model.load_state_dict(ckpt)
-            logger.info(f'Loaded {name} with msg: {msg}')
+            logger.info(f"Loaded {name} with msg: {msg}")
         except Exception as e:
-            logger.warning(f'Failed to load {name}: {e}')
+            logger.warning(f"Failed to load {name}: {e}")
     else:
         logger.warning(f'No "{name}" found in checkpoint.')
     return model
+
 
 def _set_trainability(module: nn.Module, trainable: bool, eval_when_frozen: bool = True):
     """
@@ -179,15 +179,16 @@ def _set_trainability(module: nn.Module, trainable: bool, eval_when_frozen: bool
         if eval_when_frozen:
             module.eval()
 
+
 def load_pretrained_model(
     model_path,
     encoder,
     target_encoder,
-    predictor,
+    ac_predictor,
     latent_action_enc,
     decoder,
     trainable: bool = True,
-    use_ddp: bool = True
+    use_ddp: bool = True,
 ):
     """
     Load pretrained weights for all modules and apply a unified gradient on/off switch.
@@ -197,26 +198,26 @@ def load_pretrained_model(
             Required keys:
                 - 'ac_jepa_pth': str
                     Checkpoint containing keys:
-                        'encoder', 'target_encoder', 'predictor', 'latent_action_encoder'
+                        'encoder', 'target_encoder', 'ac_predictor', 'latent_action_encoder'
                 - 'decoder_pth': str
                     Either:
                         a) checkpoint with a 'decoder' key, or
                         b) a direct state_dict compatible with decoder.load_state_dict.
-        encoder, target_encoder, predictor, latent_action_enc, decoder (nn.Module): Modules to load.
+        encoder, target_encoder, ac_predictor, latent_action_enc, decoder (nn.Module): Modules to load.
         trainable (bool): Unified switch. If False, all modules will have requires_grad(False)
                           and be set to eval() to freeze BatchNorm running stats.
         use_ddp (bool): Keep 'module.' prefixes if True; otherwise strip them.
 
     Returns:
-        tuple: (encoder, target_encoder, predictor, latent_action_enc, decoder)
+        tuple: (encoder, target_encoder, ac_predictor, latent_action_enc, decoder)
     """
 
     # ---- 1) Load AC-JEPA-side modules ----
     ac_ckpt, ac_path = None, None
     try:
-        ac_path = model_path.get('ac_jepa_pth', None) if isinstance(model_path, dict) else None
+        ac_path = model_path.get("ac_jepa_pth", None) if isinstance(model_path, dict) else None
         if ac_path:
-            ac_ckpt = torch.load(ac_path, map_location=torch.device('cpu'))
+            ac_ckpt = torch.load(ac_path, map_location=torch.device("cpu"))
         else:
             logger.warning("No 'ac_jepa_pth' provided in model_path; skipping AC-JEPA modules.")
     except Exception as e:
@@ -225,38 +226,40 @@ def load_pretrained_model(
     if ac_ckpt is not None:
         try:
             for name, module in [
-                ('encoder', encoder),
-                ('target_encoder', target_encoder),
-                ('predictor', predictor),
-                ('latent_action_encoder', latent_action_enc),
+                ("encoder", encoder),
+                ("target_encoder", target_encoder),
+                ("ac_predictor", ac_predictor),
+                ("latent_action_encoder", latent_action_enc),
             ]:
                 _ = _load_component(ac_ckpt, name, module, use_ddp)
         except Exception as e:
-            logger.info(f'Failed to load AC-JEPA modules from checkpoint: {e}')
+            logger.info(f"Failed to load AC-JEPA modules from checkpoint: {e}")
     else:
-        logger.warning('AC-JEPA checkpoint not loaded; encoder/target_encoder/predictor/latent_action_enc remain as-initialized.')
+        logger.warning(
+            "AC-JEPA checkpoint not loaded; encoder/target_encoder/ac_predictor/latent_action_enc remain as-initialized."
+        )
 
     # ---- 2) Load decoder module ----
     dec_ckpt, dec_path = None, None
     try:
-        dec_path = model_path.get('decoder_pth', None) if isinstance(model_path, dict) else None
+        dec_path = model_path.get("decoder_pth", None) if isinstance(model_path, dict) else None
         if dec_path:
-            dec_ckpt = torch.load(dec_path, map_location=torch.device('cpu'))
+            dec_ckpt = torch.load(dec_path, map_location=torch.device("cpu"))
         else:
             logger.warning("No 'decoder_pth' provided in model_path; skipping decoder load.")
     except Exception as e:
         logger.info(f'Exception when loading decoder checkpoint from "{dec_path}": {e}')
 
     if dec_ckpt is not None:
-        _ = _load_component(dec_ckpt, 'decoder', decoder, use_ddp)
+        _ = _load_component(dec_ckpt, "decoder", decoder, use_ddp)
     else:
-        logger.warning('Decoder checkpoint not loaded; decoder remains as-initialized.')
+        logger.warning("Decoder checkpoint not loaded; decoder remains as-initialized.")
 
     # ---- 3) Apply unified trainability to ALL modules ----
-    for m in (encoder, target_encoder, predictor, latent_action_enc, decoder):
+    for m in (encoder, target_encoder, ac_predictor, latent_action_enc, decoder):
         _set_trainability(m, trainable=trainable, eval_when_frozen=True)
 
-    return encoder, target_encoder, predictor, latent_action_enc, decoder
+    return encoder, target_encoder, ac_predictor, latent_action_enc, decoder
 
 
 def init_models(
@@ -316,9 +319,6 @@ def init_models(
     # --------------------------
     encoder, predictor = init_video_model(
         uniform_power=video_model_params["uniform_power"],
-        use_mask_tokens=video_model_params["use_mask_tokens"],
-        num_mask_tokens=video_model_params["num_mask_tokens"],
-        zero_init_mask_tokens=video_model_params["zero_init_mask_tokens"],
         device=device,
         patch_size=video_model_params["patch_size"],
         num_frames=video_model_params["num_frames"],
@@ -328,7 +328,6 @@ def init_models(
         pred_depth=video_model_params["pred_depth"],
         pred_embed_dim=video_model_params["pred_embed_dim"],
         use_sdpa=video_model_params["use_sdpa"],
-        adapter_type=video_model_params["adapter_type"],
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -337,7 +336,8 @@ def init_models(
     # --------------------------
     latent_action_enc = init_latent_action_encoder(
         device=device,
-        inp_dims=encoder.backbone.embed_dim, 
+        input_dim=encoder.backbone.embed_dim,
+        num_patches_per_frame=la_enc_params["num_patches_per_frame"],
         num_heads=la_enc_params["num_heads"],
         d_codebook=la_enc_params["d_codebook"],
         n_codebook=la_enc_params["n_codebook"],
@@ -345,6 +345,7 @@ def init_models(
         vq_commit_weight=la_enc_params["vq_commit_weight"],
         vq_entropy_weight=la_enc_params["vq_entropy_weight"],
         vq_diversity_weight=la_enc_params["vq_diversity_weight"],
+        use_sdpa=la_enc_params["use_sdpa"],
     )
 
     # --------------------------
@@ -354,7 +355,8 @@ def init_models(
         img_size=decoder_params["img_size"],
         patch_size=decoder_params["patch_size"],
         num_frames=decoder_params["num_frames"],
-        tubelet_size=decoder_params["tubelet_size"],
+        # Set to 1 here since we don't apply temporal compression on action-conditioned setting
+        tubelet_size=1,
         in_channels=decoder_params["in_channels"],
         in_dim=encoder.backbone.embed_dim,
         embed_dim=encoder.backbone.embed_dim // 2,
@@ -374,18 +376,13 @@ def init_video_model(
     patch_size=16,
     num_frames=16,
     tubelet_size=2,
-    model_name='vit_base',
+    model_name="vit_base",
     crop_size=224,
     pred_depth=6,
     pred_embed_dim=384,
     uniform_power=False,
-    use_mask_tokens=False,
-    num_mask_tokens=2,
-    zero_init_mask_tokens=True,
     use_sdpa=False,
-    adapter_type="None",
-)->tuple[MultiMaskWrapper, PredictorMultiMaskWrapper]:
-    
+) -> tuple[MultiMaskWrapper, PredictorMultiMaskWrapper]:
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
@@ -396,24 +393,20 @@ def init_video_model(
     )
     encoder = MultiMaskWrapper(encoder)
 
-    predictor = vit_pred.__dict__['vit_predictor'](
+    predictor = vit_ac_pred.__dict__["vit_ac_predictor"](
         img_size=crop_size,
-        use_mask_tokens=use_mask_tokens,
         patch_size=patch_size,
         num_frames=num_frames,
         tubelet_size=tubelet_size,
         embed_dim=encoder.backbone.embed_dim,
+        action_embed_dim=encoder.backbone.embed_dim,
         predictor_embed_dim=pred_embed_dim,
         depth=pred_depth,
         num_heads=encoder.backbone.num_heads,
         uniform_power=uniform_power,
-        num_mask_tokens=num_mask_tokens,
-        zero_init_mask_tokens=zero_init_mask_tokens,
         use_sdpa=use_sdpa,
-        adapter_type=adapter_type,
         action_dim=encoder.backbone.embed_dim,
     )
-    predictor = PredictorMultiMaskWrapper(predictor)
 
     encoder.to(device)
     predictor.to(device)
@@ -423,19 +416,23 @@ def init_video_model(
 
     return encoder, predictor
 
+
 def init_latent_action_encoder(
     device,
-    inp_dims: int = 192, 
+    input_dim: int,
+    num_patches_per_frame: int,
+    d_codebook: int,
+    n_codebook: int,
     num_heads: int = 8,
-    d_codebook: int = 10,
-    n_codebook: int = 1,
     vq_bias: bool = True,
     vq_commit_weight: float = 0.25,
     vq_entropy_weight: float = 0.1,
-    vq_diversity_weight: float = 1.,
-    )-> LatentActionEncoderMultiMaskWrapper:
+    vq_diversity_weight: float = 1.0,
+    use_sdpa: bool = True,
+) -> LatentActionEncoder:
     la_enc = LatentActionEncoder(
-        input_dims=inp_dims, 
+        input_dim=input_dim,
+        num_patches_per_frame=num_patches_per_frame,
         num_heads=num_heads,
         d_codebook=d_codebook,
         n_codebook=n_codebook,
@@ -443,13 +440,14 @@ def init_latent_action_encoder(
         vq_commit_weight=vq_commit_weight,
         vq_entropy_weight=vq_entropy_weight,
         vq_diversity_weight=vq_diversity_weight,
+        use_sdpa=use_sdpa,
     )
-    la_enc = LatentActionEncoderMultiMaskWrapper(la_enc)
-    
+
     la_enc = la_enc.to(device)
     logger.info(la_enc)
 
     return la_enc
+
 
 # This part are same vit_decoder/utils.py
 def unpatchify(

@@ -10,8 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from PIL import Image
-
 from app.vit_decoder.transforms import make_eval_transforms, unnormalize_tensor
 from app.vit_decoder.utils import (
     init_models,
@@ -19,15 +17,15 @@ from app.vit_decoder.utils import (
     load_jepa_encoder,
     unpatchify,
 )
+from einops import rearrange
+from PIL import Image
 from src.datasets.data_manager import init_data
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-def save_tensor_as_gif(
-    tensor: torch.Tensor, output_path: str, duration: int = 100
-) -> None:
+def save_tensor_as_gif(tensor: torch.Tensor, output_path: str, duration: int = 100) -> None:
     """
     Save a tensor of images as a GIF file.
 
@@ -62,7 +60,7 @@ def main() -> None:
     parser.add_argument("--config_path", type=str, required=True)
     args = parser.parse_args()
 
-    configs = yaml.load(open(args.config_path, "r"), Loader=yaml.FullLoader)
+    configs = yaml.load(open(args.config_path), Loader=yaml.FullLoader)
 
     # -- META
     cfgs_meta = configs.get("meta")
@@ -81,6 +79,9 @@ def main() -> None:
         dtype = torch.float32
         mixed_precision = False
 
+    # TODO: make this an config option
+    encode_frames_independently = True
+
     # -- MODEL
     cfgs_model = configs.get("model")
     model_name = cfgs_model.get("model_name")
@@ -95,9 +96,7 @@ def main() -> None:
     dataset_paths = cfgs_data.get("datasets", [])
     datasets_weights = cfgs_data.get("datasets_weights", None)
     if datasets_weights is not None:
-        assert len(datasets_weights) == len(dataset_paths), (
-            "Must have one sampling weight specified for each dataset"
-        )
+        assert len(datasets_weights) == len(dataset_paths), "Must have one sampling weight specified for each dataset"
     batch_size = cfgs_data.get("batch_size")
     num_clips = cfgs_data.get("num_clips")
     num_frames = cfgs_data.get("num_frames")
@@ -160,6 +159,7 @@ def main() -> None:
         decoder_num_heads=decoder_num_heads,
         decoder_mlp_ratio=decoder_mlp_ratio,
         decoder_norm_layer=nn.LayerNorm,
+        encode_frames_independently=encode_frames_independently,
     )
 
     # Load encoder and decoder weights
@@ -176,13 +176,24 @@ def main() -> None:
     udata = next(unsupervised_loader)
     clips = torch.cat([u.to(device, non_blocking=True) for u in udata[0]], dim=0)
 
-    with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
-        jepa_features = encoder(clips)
-        jepa_features = F.layer_norm(jepa_features, (jepa_features.size(-1),))
-        pred = decoder(jepa_features)
+    if encode_frames_independently:
+        # Rearrange clips from (B, C, T, H, W) to (B * T, C, 2, H, W),
+        # flattening the temporal dimension into the batch so each frame can
+        # be processed independently as an image. This enables the JEPA encoder
+        # to operate over frames individually.
+        x = rearrange(clips, "b c t h w -> (b t) c 1 h w").repeat(1, 1, 2, 1, 1)
+    else:
+        x = clips
 
+    with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
+        jepa_features = encoder(x)
+        jepa_features = F.layer_norm(jepa_features, (jepa_features.size(-1),))
+        if encode_frames_independently:
+            jepa_features = rearrange(jepa_features, "(b t) p d -> b (t p) d", b=clips.size(0))
+
+        pred = decoder(jepa_features)
         reconstructed = unpatchify(
-            pred, crop_size, num_frames, patch_size, tubelet_size
+            pred, crop_size, num_frames, patch_size, tubelet_size if not encode_frames_independently else 1
         )
 
     # Unnormalize the original and reconstructed clips for visualization
@@ -190,9 +201,7 @@ def main() -> None:
     reconstructed_unnormalized = unnormalize_tensor(reconstructed)
 
     # Combine the original and reconstructed clips side by side for comparison
-    side_by_side_imgs = torch.cat(
-        [clips_unnormalized, reconstructed_unnormalized], dim=4
-    )
+    side_by_side_imgs = torch.cat([clips_unnormalized, reconstructed_unnormalized], dim=4)
     for i in range(side_by_side_imgs.shape[0]):
         save_tensor_as_gif(side_by_side_imgs[i], os.path.join(folder, f"{i:02d}.gif"))
 

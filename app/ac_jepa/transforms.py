@@ -5,25 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import src.datasets.utils.video.transforms as video_transforms
 import torch
 import torchvision.transforms as transforms
-
-import src.datasets.utils.video.transforms as video_transforms
 from src.datasets.utils.video.randerase import RandomErasing
 
 
 def make_transforms(
     random_horizontal_flip=True,
-    random_resize_aspect_ratio=(3/4, 4/3),
+    random_resize_aspect_ratio=(3 / 4, 4 / 3),
     random_resize_scale=(0.3, 1.0),
     reprob=0.0,
     auto_augment=False,
     motion_shift=False,
     crop_size=224,
-    normalize=((0.485, 0.456, 0.406),
-               (0.229, 0.224, 0.225))
+    normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 ):
-
     _frames_augmentation = VideoTransform(
         random_horizontal_flip=random_horizontal_flip,
         random_resize_aspect_ratio=random_resize_aspect_ratio,
@@ -37,21 +34,18 @@ def make_transforms(
     return _frames_augmentation
 
 
-class VideoTransform(object):
-
+class VideoTransform:
     def __init__(
         self,
         random_horizontal_flip=True,
-        random_resize_aspect_ratio=(3/4, 4/3),
+        random_resize_aspect_ratio=(3 / 4, 4 / 3),
         random_resize_scale=(0.3, 1.0),
         reprob=0.0,
         auto_augment=False,
         motion_shift=False,
         crop_size=224,
-        normalize=((0.485, 0.456, 0.406),
-                   (0.229, 0.224, 0.225))
+        normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ):
-
         self.random_horizontal_flip = random_horizontal_flip
         self.random_resize_aspect_ratio = random_resize_aspect_ratio
         self.random_resize_scale = random_resize_scale
@@ -62,29 +56,29 @@ class VideoTransform(object):
         self.std = torch.tensor(normalize[1], dtype=torch.float32)
         if not self.auto_augment:
             # Without auto-augment, PIL and tensor conversions simply scale uint8 space by 255.
-            self.mean *= 255.
-            self.std *= 255.
+            self.mean *= 255.0
+            self.std *= 255.0
 
         self.autoaug_transform = video_transforms.create_random_augment(
             input_size=(crop_size, crop_size),
-            auto_augment='rand-m7-n4-mstd0.5-inc1',
-            interpolation='bicubic',
+            auto_augment="rand-m7-n4-mstd0.5-inc1",
+            interpolation="bicubic",
         )
 
-        self.spatial_transform = video_transforms.random_resized_crop_with_shift \
-            if motion_shift else video_transforms.random_resized_crop
+        self.spatial_transform = (
+            video_transforms.random_resized_crop_with_shift if motion_shift else video_transforms.random_resized_crop
+        )
 
         self.reprob = reprob
         self.erase_transform = RandomErasing(
             reprob,
-            mode='pixel',
+            mode="pixel",
             max_count=1,
             num_splits=1,
-            device='cpu',
+            device="cpu",
         )
 
     def __call__(self, buffer):
-
         if self.auto_augment:
             buffer = [transforms.ToPILImage()(frame) for frame in buffer]
             buffer = self.autoaug_transform(buffer)
@@ -126,9 +120,9 @@ def tensor_normalize(tensor, mean, std):
     if tensor.dtype == torch.uint8:
         tensor = tensor.float()
         tensor = tensor / 255.0
-    if type(mean) == list:
+    if isinstance(mean, list):
         mean = torch.tensor(mean)
-    if type(std) == list:
+    if isinstance(std, list):
         std = torch.tensor(std)
     tensor = tensor - mean
     tensor = tensor / std

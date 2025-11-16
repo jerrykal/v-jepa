@@ -34,7 +34,7 @@ class ConcatAdapter(ActionAdapter):
         B, N, D = x.shape
         action_exp = action.unsqueeze(1).expand(-1, 1, -1)     # [B, 1, D]
         return torch.cat([x, action_exp], dim=1)               # [B, N+1, D]x
-    
+
 class VisionTransformerPredictor(nn.Module):
     """ Vision Transformer """
     def __init__(
@@ -58,24 +58,26 @@ class VisionTransformerPredictor(nn.Module):
         use_mask_tokens=False,
         num_mask_tokens=2,
         zero_init_mask_tokens=True,
-        **kwargs
+        adapter_type: str | None=None,
+        action_dim: int | None=None,
+        **kwargs,
     ):
         super().__init__()
-        self.action_adapter_type = kwargs.get("adapter_type", "None")
+        self.action_adapter_type = adapter_type
 
-        # Map input to predictor dimension
-        if self.action_adapter_type != "None":
+        if self.action_adapter_type == "concat":
+            # Map input to predictor dimension
             self.predictor_context_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
             self.predictor_action_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
-        else:
-            self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
 
-        # Action input adapter
-        if self.action_adapter_type != "None":
-            self.action_dim = kwargs.get("action_dim")
+            # Action input adapter
+            self.action_dim = action_dim
             self.action_adapter = ConcatAdapter()
-        else:
+        elif self.action_adapter_type is None:
+            self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
             self.action_adapter = ActionAdapter()
+        else:
+            raise ValueError(f"Unsupported action adapter type: {self.action_adapter_type}")
 
         # Mask tokens
         self.mask_tokens = None
@@ -109,7 +111,7 @@ class VisionTransformerPredictor(nn.Module):
                 (img_size // patch_size)
                 * (img_size // patch_size)
             )
- 
+
         # Position embedding
         self.uniform_power = uniform_power
         self.predictor_pos_embed = None
@@ -219,7 +221,7 @@ class VisionTransformerPredictor(nn.Module):
         B = len(ctxt) // len(masks_ctxt)
 
         # Map context tokens to pedictor dimensions
-        if self.action_adapter_type != "None":
+        if self.action_adapter_type is not None:
             x = self.predictor_context_embed(ctxt)
             if act is not None:
                 act = self.predictor_action_embed(act)
@@ -234,7 +236,7 @@ class VisionTransformerPredictor(nn.Module):
 
         if act is not None:
             x = self.action_adapter(x, act)
-            
+
         # Map target tokens to predictor dimensions & add noise (fwd diffusion)
         if self.mask_tokens is None:
             pred_tokens = self.predictor_embed(tgt)
@@ -269,12 +271,12 @@ class VisionTransformerPredictor(nn.Module):
         x = self.predictor_norm(x)
 
         # Return output corresponding to target tokens
-        N_input = N_ctxt if self.action_adapter_type == "None" else N_ctxt+1
+        N_input = N_ctxt if self.action_adapter_type is None else N_ctxt+1
         x = x[:, N_input:]
         x = self.predictor_proj(x)
 
         return x
-    
+
 def vit_predictor(**kwargs):
     model = VisionTransformerPredictor(
         mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),

@@ -8,16 +8,15 @@
 import logging
 import sys
 
+import src.models.vision_transformer as video_vit
 import torch
 import torch.nn as nn
 from diffusers.optimization import get_scheduler
 from einops import rearrange
-from torch.nn.parallel import DistributedDataParallel
-from torch.optim.lr_scheduler import LambdaLR
-
-import src.models.vision_transformer as video_vit
 from src.models.utils.multimask import MultiMaskWrapper
 from src.models.vit_decoder import ViTVideoDecoder
+from torch.nn.parallel import DistributedDataParallel
+from torch.optim.lr_scheduler import LambdaLR
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
@@ -44,9 +43,7 @@ def load_jepa_encoder(model_path: str, encoder: nn.Module) -> None:
 
             # NOTE: since the pre-trained weights are saved with DDP wrapper, we need to remove the DDP prefix "module." if we are not using DDP
             if not isinstance(encoder, DistributedDataParallel):
-                pretrained_dict = {
-                    k.replace("module.", ""): v for k, v in pretrained_dict.items()
-                }
+                pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
 
             msg = encoder.load_state_dict(pretrained_dict)
             logger.info(f"Loaded JEPA encoder with msg: {msg}")
@@ -76,9 +73,7 @@ def load_checkpoint(
         int, the epoch of the checkpoint
     """
     try:
-        checkpoint = torch.load(
-            r_path, map_location=torch.device("cpu"), weights_only=False
-        )
+        checkpoint = torch.load(r_path, map_location=torch.device("cpu"), weights_only=False)
     except Exception as e:
         logger.info(f"Encountered exception when loading checkpoint {e}")
 
@@ -88,9 +83,7 @@ def load_checkpoint(
 
         # NOTE: since the pre-trained weights are saved with DDP wrapper, we need to remove the DDP prefix "module." if we are not using DDP
         if not isinstance(decoder, DistributedDataParallel):
-            checkpoint["decoder"] = {
-                k.replace("module.", ""): v for k, v in checkpoint["decoder"].items()
-            }
+            checkpoint["decoder"] = {k.replace("module.", ""): v for k, v in checkpoint["decoder"].items()}
 
         # -- loading decoder
         pretrained_dict = checkpoint["decoder"]
@@ -127,6 +120,7 @@ def init_models(
     decoder_num_heads: int = 16,
     decoder_mlp_ratio: float = 4.0,
     decoder_norm_layer: nn.Module = nn.LayerNorm,
+    encode_frames_independently: bool = False,
 ) -> tuple[MultiMaskWrapper, ViTVideoDecoder]:
     """
     Initialize encoder and decoder models.
@@ -163,7 +157,7 @@ def init_models(
         img_size=img_size,
         patch_size=patch_size,
         num_frames=num_frames,
-        tubelet_size=tubelet_size,
+        tubelet_size=tubelet_size if not encode_frames_independently else 1,
         in_channels=in_channels,
         in_dim=encoder.backbone.embed_dim,
         embed_dim=encoder.backbone.embed_dim // 2,
@@ -226,21 +220,11 @@ def init_opt(
     param_groups = []
     for model in models:
         param_groups.append(
-            {
-                "params": (
-                    p
-                    for n, p in model.named_parameters()
-                    if ("bias" not in n) and (len(p.shape) != 1)
-                )
-            }
+            {"params": (p for n, p in model.named_parameters() if ("bias" not in n) and (len(p.shape) != 1))}
         )
         param_groups.append(
             {
-                "params": (
-                    p
-                    for n, p in model.named_parameters()
-                    if ("bias" in n) or (len(p.shape) == 1)
-                ),
+                "params": (p for n, p in model.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
                 "WD_exclude": zero_init_bias_wd,
                 "weight_decay": 0,
             }
